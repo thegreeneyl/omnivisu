@@ -1,0 +1,3 @@
+ofxIdsPeak
+ofxGui
+ofxOpenCv

@@ -1,0 +1,37 @@
+# --- Build artifacts ---
+obj/
+# Keep bin/data (runtime assets), drop everything else generated into bin/
+bin/*
+!bin/data/
+# Inside bin/data, ignore any generated subfolders if needed (add patterns here)
+
+# Common shared libs that get copied into bin/ on Linux at build time
+# (these come from the openFrameworks distribution, not from this repo)
+*.so
+*.so.*
+*.dll
+*.dylib
+
+# Build product names (defensive, in case the binary is dropped at repo root)
+/omnivisu
+/omnivisu_debug
+
+# --- Editor / OS ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vs/
+*.user
+
+# VSCode caches (the project ships a .vscode/ folder; only ignore generated bits)
+.vscode/browse.db
+.vscode/ipch/
+.vscode/.browse.*
+
+# --- Misc ---
+*.log
+core
+core.*
