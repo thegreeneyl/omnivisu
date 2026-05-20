@@ -67,22 +67,25 @@ private:
 
 	struct Parameters {
 		ofParameterGroup group;
-		ofParameter<int> haarMinWidth{"haar min width", 500, 8, 1000};
-		ofParameter<int> haarMinHeight{"haar min height", 350, 8, 1000};
-		ofParameter<float> haarScale{"haar scale", 1.08f, 1.01f, 1.5f};
+
+		ofParameterGroup trackingGroup{"tracking"};
+		ofParameter<bool> enableEyeTracking{"enable eye tracking", true};
+		ofParameter<bool> showDebugOverlay{"show debug overlay", true};
+		ofParameter<int> trackingDownscale{"tracking downscale", 8, 1, 16};
+		ofParameter<int> haarMinWidth{"haar min width", 400, 8, 1000};
+		ofParameter<int> haarMinHeight{"haar min height", 250, 8, 1000};
+		ofParameter<float> haarScale{"haar scale", 1.01f, 1.001f, 1.5f};
 		ofParameter<int> haarNeighbors{"haar neighbors", 5, 0, 20};
 		ofParameter<int> presentOnFrames{"present on frames", 4, 1, 30};
 		ofParameter<int> presentOffFrames{"present off frames", 10, 1, 60};
 		ofParameter<float> euroMinCutoff{"euro min cutoff", 0.5f, 0.01f, 5.0f};
 		ofParameter<float> euroBeta{"euro beta", 0.007f, 0.0f, 0.1f};
-		ofParameter<bool> enableEyeTracking{"enable eye tracking", true};
-		ofParameter<bool> showDebugOverlay{"show debug overlay", true};
 
 		ofParameterGroup gradingGroup{"grading"};
 		ofParameter<bool> enableGrading{"enable grading", true};
 		ofParameter<float> gradeExposure{"exposure (stops)", 0.0f, -2.0f, 2.0f};
 		ofParameter<float> gradeBrightness{"brightness", 0.0f, -0.5f, 0.5f};
-		ofParameter<float> gradeContrast{"contrast", 1.0f, 0.0f, 2.0f};
+		ofParameter<float> gradeContrast{"contrast", 1.6f, 0.0f, 2.0f};
 		ofParameter<float> gradeGamma{"gamma", 1.0f, 0.3f, 3.0f};
 		ofParameter<float> gradeSaturation{"saturation", 1.0f, 0.0f, 2.0f};
 	};
@@ -114,6 +117,7 @@ private:
 	ofxCvColorImage cvColor;
 	ofxCvGrayscaleImage cvGray;
 	ofxCvHaarFinder eyeFinder;
+	ofPixels detectionPixels; ///< Worker-only scratch buffer for downsampled tracking input.
 
 	RawDetection lastRaw;
 	ofRectangle lastEyeBox;

@@ -23,16 +23,21 @@ float rectDistanceSq(const ofRectangle & a, const ofRectangle & b) {
 void EyeCameraStream::setupParameters() {
 	parameters.group.setName(config.name);
 	parameters.group.add(grabber.parameters.group);
-	parameters.group.add(parameters.haarMinWidth);
-	parameters.group.add(parameters.haarMinHeight);
-	parameters.group.add(parameters.haarScale);
-	parameters.group.add(parameters.haarNeighbors);
-	parameters.group.add(parameters.presentOnFrames);
-	parameters.group.add(parameters.presentOffFrames);
-	parameters.group.add(parameters.euroMinCutoff);
-	parameters.group.add(parameters.euroBeta);
-	parameters.group.add(parameters.enableEyeTracking);
-	parameters.group.add(parameters.showDebugOverlay);
+
+	parameters.trackingGroup.clear();
+	parameters.trackingGroup.setName("tracking");
+	parameters.trackingGroup.add(parameters.enableEyeTracking);
+	parameters.trackingGroup.add(parameters.showDebugOverlay);
+	parameters.trackingGroup.add(parameters.trackingDownscale);
+	parameters.trackingGroup.add(parameters.haarMinWidth);
+	parameters.trackingGroup.add(parameters.haarMinHeight);
+	parameters.trackingGroup.add(parameters.haarScale);
+	parameters.trackingGroup.add(parameters.haarNeighbors);
+	parameters.trackingGroup.add(parameters.presentOnFrames);
+	parameters.trackingGroup.add(parameters.presentOffFrames);
+	parameters.trackingGroup.add(parameters.euroMinCutoff);
+	parameters.trackingGroup.add(parameters.euroBeta);
+	parameters.group.add(parameters.trackingGroup);
 
 	parameters.gradingGroup.clear();
 	parameters.gradingGroup.setName("grading");
@@ -51,8 +56,9 @@ bool EyeCameraStream::setup(const Config & cfg) {
 	setupParameters();
 
 	grabber.parameters.exposureAuto = false;
-	grabber.parameters.exposureUs = 8000;     // 4 ms exposure
-	grabber.parameters.gain = 2.0f;
+	grabber.parameters.exposureUs = 16000;     // 4 ms exposure
+	grabber.parameters.gainAuto = false;
+	grabber.parameters.gain = 4.0f;
 	grabber.parameters.gamma = 2.0f;
 	grabber.parameters.fps = 60.0f;
 	grabber.parameters.wbAuto = false;
@@ -232,36 +238,96 @@ bool EyeCameraStream::detectEye(const ofPixels & pixels, RawDetection & out) {
 		return false;
 	}
 
+	// Optionally downsample the tracking input. Display path is unaffected -
+	// this only resizes the worker copy of the frame before the cascade runs.
+	const int srcW = static_cast<int>(pixels.getWidth());
+	const int srcH = static_cast<int>(pixels.getHeight());
+	const int downscale = std::max(1, parameters.trackingDownscale.get());
+	const int detW = std::max(1, srcW / downscale);
+	const int detH = std::max(1, srcH / downscale);
+
+	const ofPixels * detectionInput = &pixels;
+	if (downscale > 1) {
+		// ofPixels::resize bilinear path is not implemented in OF 0.12, so we
+		// downsample with OpenCV. INTER_AREA is the recommended filter for
+		// downsampling: it averages source pixels, giving cleaner low-pass
+		// behavior than nearest-neighbor without ringing artifacts.
+		const ofImageType ofType = pixels.getImageType();
+		if (!detectionPixels.isAllocated()
+			|| static_cast<int>(detectionPixels.getWidth()) != detW
+			|| static_cast<int>(detectionPixels.getHeight()) != detH
+			|| detectionPixels.getImageType() != ofType) {
+			detectionPixels.allocate(detW, detH, ofType);
+		}
+
+		const int channels = static_cast<int>(pixels.getNumChannels());
+		const int cvType = (channels == 1) ? CV_8UC1
+						: (channels == 3) ? CV_8UC3
+						: (channels == 4) ? CV_8UC4 : 0;
+		if (cvType == 0) {
+			ofLogWarning("EyeCameraStream") << "tracking downscale: unsupported channel count "
+				<< channels << ", falling back to full-resolution detection";
+		} else {
+			cv::Mat srcMat(srcH, srcW, cvType,
+				const_cast<unsigned char *>(pixels.getData()));
+			cv::Mat dstMat(detH, detW, cvType, detectionPixels.getData());
+			cv::resize(srcMat, dstMat, cv::Size(detW, detH), 0, 0, cv::INTER_AREA);
+			detectionInput = &detectionPixels;
+		}
+	}
+
 	// ofxCvImage::setFromPixels(const ofPixels&) ignores channel count and copies
 	// raw bytes, which corrupts the grayscale image when given RGB input. Route
 	// RGB through ofxCvColorImage so operator= performs the proper color->gray.
-	const int srcW = static_cast<int>(pixels.getWidth());
-	const int srcH = static_cast<int>(pixels.getHeight());
-	if (pixels.getNumChannels() >= 3) {
+	if (detectionInput->getNumChannels() >= 3) {
 		if (!cvColor.bAllocated
-			|| static_cast<int>(cvColor.getWidth()) != srcW
-			|| static_cast<int>(cvColor.getHeight()) != srcH) {
-			cvColor.allocate(srcW, srcH);
+			|| static_cast<int>(cvColor.getWidth()) != detW
+			|| static_cast<int>(cvColor.getHeight()) != detH) {
+			cvColor.allocate(detW, detH);
 		}
-		cvColor.setFromPixels(pixels);
+		// Reallocate cvGray to match the new size too, otherwise the operator=
+		// rejects the assignment with "region of interest mismatch" the first
+		// time the user changes tracking downscale at runtime.
+		if (!cvGray.bAllocated
+			|| static_cast<int>(cvGray.getWidth()) != detW
+			|| static_cast<int>(cvGray.getHeight()) != detH) {
+			cvGray.allocate(detW, detH);
+		}
+		cvColor.setFromPixels(*detectionInput);
 		cvGray = cvColor;
 	} else {
 		if (!cvGray.bAllocated
-			|| static_cast<int>(cvGray.getWidth()) != srcW
-			|| static_cast<int>(cvGray.getHeight()) != srcH) {
-			cvGray.allocate(srcW, srcH);
+			|| static_cast<int>(cvGray.getWidth()) != detW
+			|| static_cast<int>(cvGray.getHeight()) != detH) {
+			cvGray.allocate(detW, detH);
 		}
-		cvGray.setFromPixels(pixels);
+		cvGray.setFromPixels(*detectionInput);
 	}
 
 	eyeFinder.setScaleHaar(parameters.haarScale);
 	eyeFinder.setNeighbors(parameters.haarNeighbors);
 
-	const int minW = parameters.haarMinWidth;
-	const int minH = parameters.haarMinHeight;
+	// User-facing haar min size is in *source pixels* for intuitive tuning,
+	// so we divide by the downscale factor before passing to the cascade.
+	const int minW = std::max(1, parameters.haarMinWidth.get() / downscale);
+	const int minH = std::max(1, parameters.haarMinHeight.get() / downscale);
 	const int n = eyeFinder.findHaarObjects(cvGray, minW, minH);
 	if (n <= 0 || eyeFinder.blobs.empty()) {
 		return false;
+	}
+
+	// Cascade returns blobs in detection-image coordinates. Map back to source
+	// pixels so the picker, smoothing, and overlay all work in the same space.
+	if (downscale > 1) {
+		const float s = static_cast<float>(downscale);
+		for (auto & blob : eyeFinder.blobs) {
+			blob.boundingRect.x *= s;
+			blob.boundingRect.y *= s;
+			blob.boundingRect.width *= s;
+			blob.boundingRect.height *= s;
+			blob.centroid.x *= s;
+			blob.centroid.y *= s;
+		}
 	}
 
 	const ofxCvBlob eyeBlob = pickBestEyeBlob(eyeFinder.blobs);
@@ -274,7 +340,7 @@ bool EyeCameraStream::detectEye(const ofPixels & pixels, RawDetection & out) {
 	out.valid = true;
 
 	const float areaNorm = (out.eyeBox.width * out.eyeBox.height)
-		/ std::max(1.0f, static_cast<float>(pixels.getWidth() * pixels.getHeight()));
+		/ std::max(1.0f, static_cast<float>(srcW * srcH));
 	out.confidence = clamp01(areaNorm * 25.0f);
 
 	lastEyeBox = out.eyeBox;
@@ -297,6 +363,10 @@ void EyeCameraStream::applySmoothing(const RawDetection & raw, float dt) {
 	}
 	if (presentSmoothed && presentMissStreak >= parameters.presentOffFrames) {
 		presentSmoothed = false;
+		// PRESENT -> LOST transition: drop the temporal anchor so the next
+		// detection picks the strongest blob by area only. Prevents a single
+		// false positive (chin, mouth, etc.) from sticking via temporal score.
+		hasLastEyeBox = false;
 	}
 
 	result.present = presentSmoothed;
