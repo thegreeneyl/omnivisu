@@ -48,6 +48,13 @@ void EyeCameraStream::setupParameters() {
 	parameters.gradingGroup.add(parameters.gradeGamma);
 	parameters.gradingGroup.add(parameters.gradeSaturation);
 	parameters.group.add(parameters.gradingGroup);
+
+	parameters.viewGroup.clear();
+	parameters.viewGroup.setName("view");
+	parameters.viewGroup.add(parameters.viewScale);
+	parameters.viewGroup.add(parameters.followEye);
+	parameters.viewGroup.add(parameters.followSmoothing);
+	parameters.group.add(parameters.viewGroup);
 }
 
 //--------------------------------------------------------------
@@ -55,20 +62,13 @@ bool EyeCameraStream::setup(const Config & cfg) {
 	config = cfg;
 	setupParameters();
 
-	grabber.parameters.exposureAuto = false;
-	grabber.parameters.exposureUs = 16000;     // 4 ms exposure
-	grabber.parameters.gainAuto = false;
-	grabber.parameters.gain = 4.0f;
-	grabber.parameters.gamma = 2.0f;
-	grabber.parameters.fps = 60.0f;
-	grabber.parameters.wbAuto = false;
-	grabber.parameters.wbR = 2.0f;
-	grabber.parameters.wbG = 1.0f;
-	grabber.parameters.wbB = 2.0f;
-
 	// Camera publishes RGB color frames so the rendered FBO stays RGB; the
 	// detection worker desaturates internally via ofxCvGrayscaleImage.
 	grabber.applyLowLatencyPreset(ofxIdsPeak::OutputFormat::RGB);
+
+	// Load tunable params from JSON before the grabber initializes so the
+	// camera comes up with the persisted exposure/gain/WB/etc. values.
+	loadParameters();
 
 	const bool grabberOk = grabber.setup();
 	if (!grabberOk) {
@@ -106,6 +106,7 @@ bool EyeCameraStream::setup(const Config & cfg) {
 	filterEyeY.setup(minCutoff, beta);
 
 	workerLastFrameTime = ofGetElapsedTimef();
+	lastFollowTime = workerLastFrameTime;
 	startThread();
 	ofLogNotice("EyeCameraStream") << config.name << ": detection worker thread started";
 
@@ -179,6 +180,39 @@ bool EyeCameraStream::buildGradeShader(bool useRect) {
 	}
 	gradeShaderUsesRect = useRect;
 	return ok;
+}
+
+//--------------------------------------------------------------
+std::string EyeCameraStream::paramsFilePath() const {
+	return config.paramsFile.empty() ? config.name + ".json" : config.paramsFile;
+}
+
+//--------------------------------------------------------------
+bool EyeCameraStream::loadParameters() {
+	const auto path = ofToDataPath(paramsFilePath(), true);
+	if (!ofFile::doesFileExist(path)) {
+		ofLogError("EyeCameraStream") << config.name
+			<< ": params file not found at " << path
+			<< " - using bare ofParameter declarations";
+		return false;
+	}
+	const ofJson json = ofLoadJson(path);
+	ofDeserialize(json, parameters.group);
+	ofLogNotice("EyeCameraStream") << config.name << ": params loaded from " << path;
+	return true;
+}
+
+//--------------------------------------------------------------
+bool EyeCameraStream::saveParameters() const {
+	const auto path = ofToDataPath(paramsFilePath(), true);
+	ofJson json;
+	ofSerialize(json, parameters.group);
+	if (!ofSavePrettyJson(path, json)) {
+		ofLogError("EyeCameraStream") << config.name << ": failed to save " << path;
+		return false;
+	}
+	ofLogNotice("EyeCameraStream") << config.name << ": params saved to " << path;
+	return true;
 }
 
 //--------------------------------------------------------------
@@ -420,9 +454,70 @@ void EyeCameraStream::renderTargetFbo() {
 			drawH = fboH;
 			drawW = fboH * srcAspect;
 		}
+		// Apply user-controlled view scale on top of the aspect-preserving fit.
+		// scale > 1 zooms in (image is cropped by the FBO); scale < 1 zooms out.
+		const float s = std::max(0.0001f, parameters.viewScale.get());
+		drawW *= s;
+		drawH *= s;
 		drawX = (fboW - drawW) * 0.5f;
 		drawY = (fboH - drawH) * 0.5f;
+
+		// Eye-follow: shift the source image so the (smoothed) eye center sits
+		// at the FBO center, then clamp so the FBO is always fully covered.
+		// The mirror is symmetric for centering, so the same formula and clamp
+		// apply whether config.mirrorX is true or false.
+		const float now = ofGetElapsedTimef();
+		const float dt = std::max(0.001f, std::min(0.25f, now - lastFollowTime));
+		lastFollowTime = now;
+
+		if (parameters.followEye.get()) {
+			const Result snap = getResult();
+			const bool haveDetection = (snap.eyeBox.width > 0.0f && snap.eyeBox.height > 0.0f);
+			if (haveDetection) {
+				const float targetX = snap.eyeCenter.x;
+				const float targetY = snap.eyeCenter.y;
+				if (followSmoothedX < 0.0f) {
+					// First sample: snap rather than animate in from (0, 0).
+					followSmoothedX = targetX;
+					followSmoothedY = targetY;
+				} else {
+					// Time-based exponential low-pass; slider == 0 disables smoothing,
+					// slider == 1 maps to a ~0.5 s time constant.
+					const float smoothing = std::min(0.999f, std::max(0.0f, parameters.followSmoothing.get()));
+					const float tau = smoothing * 0.5f;
+					const float alpha = (tau > 1e-4f) ? (1.0f - std::exp(-dt / tau)) : 1.0f;
+					followSmoothedX += alpha * (targetX - followSmoothedX);
+					followSmoothedY += alpha * (targetY - followSmoothedY);
+				}
+			}
+
+			if (followSmoothedX >= 0.0f) {
+				drawX = fboW * 0.5f - (followSmoothedX / srcW) * drawW;
+				drawY = fboH * 0.5f - (followSmoothedY / srcH) * drawH;
+			}
+		} else {
+			// Reset so a future enable re-snaps to the next valid detection.
+			followSmoothedX = -1.0f;
+			followSmoothedY = -1.0f;
+		}
+
+		// Clamp so the camera image always fully covers the FBO (no black
+		// background visible). When the scaled image is smaller than the FBO
+		// in either axis, follow is impossible without exposing black, so we
+		// fall back to centered drawing along that axis.
+		if (drawW >= fboW) {
+			drawX = std::min(0.0f, std::max(fboW - drawW, drawX));
+		} else {
+			drawX = (fboW - drawW) * 0.5f;
+		}
+		if (drawH >= fboH) {
+			drawY = std::min(0.0f, std::max(fboH - drawH, drawY));
+		} else {
+			drawY = (fboH - drawH) * 0.5f;
+		}
 	}
+
+	lastLayout = {drawX, drawY, drawW, drawH, true};
 
 	targetFbo.begin();
 	ofClear(0, 0, 0, 255);
@@ -592,19 +687,34 @@ void EyeCameraStream::drawDebug(float x, float y, float w, float h) const {
 	float imgW = w;
 	float imgH = h;
 	if (fboW > 0.0f && fboH > 0.0f) {
-		const float srcAspect = srcW / srcH;
-		const float fboAspect = fboW / fboH;
-		float drawW = fboW;
-		float drawH = fboH;
-		if (srcAspect > fboAspect) {
-			drawW = fboW;
-			drawH = fboW / srcAspect;
+		float drawX, drawY, drawW, drawH;
+		if (lastLayout.valid) {
+			// Use the same layout renderTargetFbo() applied, so the overlay
+			// follows the camera through scale and eye-follow shifts.
+			drawX = lastLayout.x;
+			drawY = lastLayout.y;
+			drawW = lastLayout.w;
+			drawH = lastLayout.h;
 		} else {
+			// Fallback for the very first frame, before renderTargetFbo has run:
+			// centered, scale-aware letterbox fit (matches the no-follow path).
+			const float srcAspect = srcW / srcH;
+			const float fboAspect = fboW / fboH;
+			drawW = fboW;
 			drawH = fboH;
-			drawW = fboH * srcAspect;
+			if (srcAspect > fboAspect) {
+				drawW = fboW;
+				drawH = fboW / srcAspect;
+			} else {
+				drawH = fboH;
+				drawW = fboH * srcAspect;
+			}
+			const float s = std::max(0.0001f, parameters.viewScale.get());
+			drawW *= s;
+			drawH *= s;
+			drawX = (fboW - drawW) * 0.5f;
+			drawY = (fboH - drawH) * 0.5f;
 		}
-		const float drawX = (fboW - drawW) * 0.5f;
-		const float drawY = (fboH - drawH) * 0.5f;
 		const float fboToDispX = w / fboW;
 		const float fboToDispY = h / fboH;
 		imgX = x + drawX * fboToDispX;

@@ -1,5 +1,6 @@
 #include "ofApp.h"
 
+#include <array>
 #include <sstream>
 
 //--------------------------------------------------------------
@@ -8,22 +9,59 @@ void ofApp::setup() {
 	ofSetVerticalSync(true);
 	ofBackground(0);
 
-	EyeCameraStream::Config cfg;
-	cfg.name = "eye0";
-	cfg.fboSize = {672, 504};
-	cfg.mirrorX = true;
+	const std::array<std::string, 2> names = {"eye0", "eye1"};
+	for (const auto & name : names) {
+		EyeCameraStream::Config cfg;
+		cfg.name = name;
+		cfg.fboSize = {672, 504};
+		cfg.mirrorX = true;
 
-	auto stream = std::make_unique<EyeCameraStream>();
-	if (!stream->setup(cfg)) {
-		ofLogError("omnivisu") << "Failed to initialize eye camera stream";
+		auto stream = std::make_unique<EyeCameraStream>();
+		if (!stream->setup(cfg)) {
+			ofLogError("omnivisu") << "Failed to initialize " << name << " camera stream";
+		}
+		streams.push_back(std::move(stream));
 	}
-	streams.push_back(std::move(stream));
 
-	gui.setup("omnivisu");
-	for (const auto & s : streams) {
-		gui.add(s->getParameters());
+	guis.reserve(streams.size());
+	for (size_t i = 0; i < streams.size(); ++i) {
+		auto panel = std::make_unique<ofxPanel>();
+		panel->setup(streams[i]->getName());
+		panel->add(streams[i]->getGrabberParameters());
+		panel->add(streams[i]->getTrackingParameters());
+		panel->add(streams[i]->getGradingParameters());
+		panel->add(streams[i]->getViewParameters());
+		guis.push_back(std::move(panel));
 	}
-	gui.setPosition(10, 10);
+	layoutGuis();
+}
+
+//--------------------------------------------------------------
+void ofApp::layoutGuis() {
+	const float screenW = ofGetWidth();
+	const float screenH = ofGetHeight();
+	const int n = static_cast<int>(streams.size());
+	if (n == 0 || guis.size() != streams.size()) {
+		return;
+	}
+
+	const float slotW = screenW / static_cast<float>(n);
+	const float pad = 10.0f;
+
+	for (int i = 0; i < n; ++i) {
+		const float texW = streams[i]->getTargetFbo().getWidth() > 0
+			? static_cast<float>(streams[i]->getTargetFbo().getWidth())
+			: 672.0f;
+		const float texH = streams[i]->getTargetFbo().getHeight() > 0
+			? static_cast<float>(streams[i]->getTargetFbo().getHeight())
+			: 504.0f;
+		const float scale = std::min(slotW / texW, screenH / texH);
+		const float drawW = texW * scale;
+		const float drawH = texH * scale;
+		const float drawX = slotW * static_cast<float>(i) + (slotW - drawW) * 0.5f;
+		const float drawY = (screenH - drawH) * 0.5f;
+		guis[i]->setPosition(drawX + pad, drawY + pad);
+	}
 }
 
 //--------------------------------------------------------------
@@ -87,7 +125,9 @@ void ofApp::draw() {
 	}
 
 	if (showGui) {
-		gui.draw();
+		for (auto & panel : guis) {
+			panel->draw();
+		}
 	}
 
 	if (showFps) {
@@ -107,6 +147,14 @@ void ofApp::keyPressed(int key) {
 		showGui = !showGui;
 	} else if (key == 'f' || key == 'F') {
 		showFps = !showFps;
+	} else if (key == 's' || key == 'S') {
+		for (const auto & stream : streams) {
+			stream->saveParameters();
+		}
+	} else if (key == 'r' || key == 'R') {
+		for (const auto & stream : streams) {
+			stream->loadParameters();
+		}
 	}
 }
 
@@ -140,6 +188,7 @@ void ofApp::mouseExited(int x, int y) {
 
 //--------------------------------------------------------------
 void ofApp::windowResized(int w, int h) {
+	layoutGuis();
 }
 
 //--------------------------------------------------------------

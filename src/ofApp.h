@@ -27,8 +27,10 @@ public:
 	void gotMessage(ofMessage msg) override;
 
 private:
+	void layoutGuis();
+
 	std::vector<std::unique_ptr<EyeCameraStream>> streams;
-	ofxPanel gui;
+	std::vector<std::unique_ptr<ofxPanel>> guis;
 	bool showGui = false;
 	bool showFps = false;
 	float lastFpsLogTime = 0.0f;

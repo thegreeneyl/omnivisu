@@ -29,6 +29,7 @@ public:
 		std::string name = "eye";
 		glm::ivec2 fboSize = {672, 504};
 		std::string cascadeFile = "haarcascade_eye.xml";
+		std::string paramsFile;
 		bool mirrorX = true;
 	};
 
@@ -52,7 +53,14 @@ public:
 	}
 	const ofxIdsPeak::Grabber & getGrabber() const { return grabber; }
 	ofParameterGroup & getParameters() { return parameters.group; }
+	ofParameterGroup & getGrabberParameters() { return grabber.parameters.group; }
+	ofParameterGroup & getTrackingParameters() { return parameters.trackingGroup; }
+	ofParameterGroup & getGradingParameters() { return parameters.gradingGroup; }
+	ofParameterGroup & getViewParameters() { return parameters.viewGroup; }
 	const std::string & getName() const { return config.name; }
+
+	bool saveParameters() const;
+	bool loadParameters();
 
 	std::uint64_t getDetectionCount() const { return detectionsRun.load(); }
 	std::uint64_t getValidDetectionCount() const { return detectionsValid.load(); }
@@ -88,6 +96,11 @@ private:
 		ofParameter<float> gradeContrast{"contrast", 1.6f, 0.0f, 2.0f};
 		ofParameter<float> gradeGamma{"gamma", 1.0f, 0.3f, 3.0f};
 		ofParameter<float> gradeSaturation{"saturation", 1.0f, 0.0f, 2.0f};
+
+		ofParameterGroup viewGroup{"view"};
+		ofParameter<float> viewScale{"scale", 2.0f, 0.1f, 10.0f};
+		ofParameter<bool> followEye{"follow eye", false};
+		ofParameter<float> followSmoothing{"follow smoothing", 0.5f, 0.0f, 1.0f};
 	};
 
 	struct FrameJob {
@@ -104,6 +117,7 @@ private:
 	void resetWorkerStateLocked();
 	bool buildGradeShader(bool useRect);
 	void drawCameraIntoFbo(float drawX, float drawY, float drawW, float drawH);
+	std::string paramsFilePath() const;
 
 	Config config;
 	Parameters parameters;
@@ -134,6 +148,24 @@ private:
 
 	OneEuroFilter filterEyeX;
 	OneEuroFilter filterEyeY;
+
+	// Eye-follow smoothing state. <0 marks an uninitialized smoothed center so
+	// the first valid detection snaps in (no lurch from origin) and subsequent
+	// detections low-pass toward it.
+	float followSmoothedX = -1.0f;
+	float followSmoothedY = -1.0f;
+	float lastFollowTime = 0.0f;
+
+	// Layout actually used by the most recent renderTargetFbo() call. Shared
+	// with drawDebug() so overlays stay aligned through scale and follow shifts.
+	struct DrawLayout {
+		float x = 0.0f;
+		float y = 0.0f;
+		float w = 0.0f;
+		float h = 0.0f;
+		bool valid = false;
+	};
+	DrawLayout lastLayout;
 
 	std::atomic<std::uint64_t> detectionsRun{0};
 	std::atomic<std::uint64_t> detectionsValid{0};

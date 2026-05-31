@@ -1,0 +1,53 @@
+{
+    "eye0": {
+        "ofxIdsPeak": {
+            "exposure_auto": false,
+            "exposure__us_": 16000.0,
+            "gain_auto": false,
+            "gain": 4.0,
+            "gamma": 2.0,
+            "wb_auto": false,
+            "wb_red": 2.0,
+            "wb_green": 1.0,
+            "wb_blue": 2.0,
+            "fps_cap": 60.0,
+            "black_level": 0.0,
+            "reverse_x": false,
+            "reverse_y": false,
+            "saturation": 1.0,
+            "sharpness": 0.0,
+            "exposure_auto_upper__us_": 100000.0,
+            "exposure_auto_lower__us_": 50.0,
+            "gain_auto_upper": 16.0,
+            "gain_auto_lower": 1.0,
+            "processing_mode": 1,
+            "output_format": 1
+        },
+        "tracking": {
+            "enable_eye_tracking": true,
+            "show_debug_overlay": false,
+            "tracking_downscale": 8,
+            "haar_min_width": 400,
+            "haar_min_height": 250,
+            "haar_scale": 1.01,
+            "haar_neighbors": 5,
+            "present_on_frames": 4,
+            "present_off_frames": 10,
+            "euro_min_cutoff": 0.5,
+            "euro_beta": 0.007
+        },
+        "grading": {
+            "enable_grading": true,
+            "exposure__stops_": 0.0,
+            "brightness": 0.0,
+            "contrast": 1.6,
+            "gamma": 1.0,
+            "saturation": 1.0
+        },
+        "view": {
+            "scale": 2.0,
+            "follow_eye": true,
+            "follow_smoothing": 0.7
+        }
+    }
+}
