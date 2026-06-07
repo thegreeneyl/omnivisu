@@ -1,0 +1,7 @@
+{
+    "mask_image": "260408-TGE-OMNI-FrantalView.png",
+    "image_size": { "w": 4000, "h": 4000 },
+    "anchor":     { "x": 2000, "y": 1500 },
+    "left_eye":   { "x": 1030, "y": 1073, "w": 414, "h": 280, "stream": 0 },
+    "right_eye":  { "x": 2551, "y": 1071, "w": 414, "h": 280, "stream": 1 }
+}

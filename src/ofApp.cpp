@@ -1,7 +1,45 @@
 #include "ofApp.h"
 
+#include <algorithm>
 #include <array>
 #include <sstream>
+
+namespace {
+
+/// Draws a stream's FBO into dst with a "cover" fit (preserve aspect, crop
+/// overflow) so the eye opening is fully filled with no distortion or
+/// background. GL scissor clips the cropped overflow to the eye rect.
+void drawStreamCover(const EyeCameraStream & stream, const ofRectangle & dst) {
+	const auto & fbo = stream.getTargetFbo();
+	if (!fbo.isAllocated() || dst.width <= 0.0f || dst.height <= 0.0f) {
+		return;
+	}
+	const float fboW = fbo.getWidth();
+	const float fboH = fbo.getHeight();
+	if (fboW <= 0.0f || fboH <= 0.0f) {
+		return;
+	}
+
+	const float scale = std::max(dst.width / fboW, dst.height / fboH);
+	const float drawW = fboW * scale;
+	const float drawH = fboH * scale;
+	const float drawX = dst.x + (dst.width - drawW) * 0.5f;
+	const float drawY = dst.y + (dst.height - drawH) * 0.5f;
+
+	ofPushStyle();
+	ofSetColor(255);
+	glEnable(GL_SCISSOR_TEST);
+	// GL scissor origin is bottom-left, so flip the y of the dst rect.
+	glScissor(static_cast<GLint>(dst.x),
+		static_cast<GLint>(ofGetWindowHeight() - (dst.y + dst.height)),
+		static_cast<GLsizei>(dst.width),
+		static_cast<GLsizei>(dst.height));
+	fbo.draw(drawX, drawY, drawW, drawH);
+	glDisable(GL_SCISSOR_TEST);
+	ofPopStyle();
+}
+
+} // namespace
 
 //--------------------------------------------------------------
 void ofApp::setup() {
@@ -34,6 +72,12 @@ void ofApp::setup() {
 		guis.push_back(std::move(panel));
 	}
 	layoutGuis();
+
+	maskLoaded = maskLayout.load("mask_layout.json");
+	if (!maskLoaded) {
+		ofLogWarning("omnivisu") << "mask layout not loaded; falling back to side-by-side view";
+		maskMode = false;
+	}
 }
 
 //--------------------------------------------------------------
@@ -95,7 +139,9 @@ void ofApp::draw() {
 	const float screenH = ofGetHeight();
 	const int n = static_cast<int>(streams.size());
 
-	if (n == 0) {
+	if (maskMode && maskLoaded) {
+		drawMasked();
+	} else if (n == 0) {
 		ofSetColor(255);
 		ofDrawBitmapString("omnivisu — no camera streams", 20, 20);
 	} else {
@@ -137,6 +183,26 @@ void ofApp::draw() {
 }
 
 //--------------------------------------------------------------
+void ofApp::drawMasked() {
+	ofClear(0);
+
+	const MaskLayout::ScreenLayout sl = maskLayout.compute(ofGetWidth(), ofGetHeight());
+	const int n = static_cast<int>(streams.size());
+
+	const int leftIdx = maskLayout.getLeftStreamIndex();
+	const int rightIdx = maskLayout.getRightStreamIndex();
+	if (leftIdx >= 0 && leftIdx < n) {
+		drawStreamCover(*streams[leftIdx], sl.leftEyeScreen);
+	}
+	if (rightIdx >= 0 && rightIdx < n) {
+		drawStreamCover(*streams[rightIdx], sl.rightEyeScreen);
+	}
+
+	ofEnableAlphaBlending();
+	maskLayout.drawMask(sl);
+}
+
+//--------------------------------------------------------------
 void ofApp::exit() {
 	streams.clear();
 }
@@ -145,6 +211,10 @@ void ofApp::exit() {
 void ofApp::keyPressed(int key) {
 	if (key == 'g' || key == 'G') {
 		showGui = !showGui;
+	} else if (key == 'm' || key == 'M') {
+		if (maskLoaded) {
+			maskMode = !maskMode;
+		}
 	} else if (key == 'f' || key == 'F') {
 		showFps = !showFps;
 	} else if (key == 's' || key == 'S') {

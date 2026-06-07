@@ -45,7 +45,7 @@
             "saturation": 1.0
         },
         "view": {
-            "scale": 2.8,
+            "scale": 2.0,
             "follow_eye": true,
             "follow_smoothing": 0.7
         }

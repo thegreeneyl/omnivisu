@@ -3,6 +3,7 @@
 #include "ofMain.h"
 #include "ofxGui.h"
 #include "EyeCameraStream.h"
+#include "MaskLayout.h"
 
 #include <memory>
 #include <vector>
@@ -28,9 +29,13 @@ public:
 
 private:
 	void layoutGuis();
+	void drawMasked();
 
 	std::vector<std::unique_ptr<EyeCameraStream>> streams;
 	std::vector<std::unique_ptr<ofxPanel>> guis;
+	MaskLayout maskLayout;
+	bool maskMode = true;
+	bool maskLoaded = false;
 	bool showGui = false;
 	bool showFps = false;
 	float lastFpsLogTime = 0.0f;
