@@ -99,8 +99,19 @@ private:
 
 		ofParameterGroup viewGroup{"view"};
 		ofParameter<float> viewScale{"scale", 2.0f, 0.1f, 10.0f};
+		// fit to fill ON: scale is a multiplier on the aspect-fit baseline that
+		// shrinks the whole frame into the FBO. OFF: scale is the exact camera
+		// pixel -> FBO pixel factor (1.0 == one camera pixel per FBO pixel).
+		ofParameter<bool> fitToFill{"fit to fill", true};
 		ofParameter<bool> followEye{"follow eye", false};
 		ofParameter<float> followSmoothing{"follow smoothing", 0.5f, 0.0f, 1.0f};
+
+		// FBO (per-eye render target) dimensions. Read from JSON at setup time
+		// and applied to Config::fboSize before allocation. Not added to the
+		// runtime GUI because changing them only takes effect on startup.
+		ofParameterGroup fboGroup{"fbo"};
+		ofParameter<int> fboWidth{"width", 672, 1, 8192};
+		ofParameter<int> fboHeight{"height", 504, 1, 8192};
 	};
 
 	struct FrameJob {

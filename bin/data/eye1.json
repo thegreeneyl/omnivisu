@@ -45,9 +45,14 @@
             "saturation": 1.0
         },
         "view": {
-            "scale": 2.0,
+            "scale": 1.0,
+            "fit_to_fill": false,
             "follow_eye": true,
             "follow_smoothing": 0.7
+        },
+        "fbo": {
+            "width": 672,
+            "height": 504
         }
     }
 }

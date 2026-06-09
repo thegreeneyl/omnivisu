@@ -52,9 +52,16 @@ void EyeCameraStream::setupParameters() {
 	parameters.viewGroup.clear();
 	parameters.viewGroup.setName("view");
 	parameters.viewGroup.add(parameters.viewScale);
+	parameters.viewGroup.add(parameters.fitToFill);
 	parameters.viewGroup.add(parameters.followEye);
 	parameters.viewGroup.add(parameters.followSmoothing);
 	parameters.group.add(parameters.viewGroup);
+
+	parameters.fboGroup.clear();
+	parameters.fboGroup.setName("fbo");
+	parameters.fboGroup.add(parameters.fboWidth);
+	parameters.fboGroup.add(parameters.fboHeight);
+	parameters.group.add(parameters.fboGroup);
 }
 
 //--------------------------------------------------------------
@@ -96,6 +103,11 @@ bool EyeCameraStream::setup(const Config & cfg) {
 	cvColor.setUseTexture(false);
 	cvGray.setUseTexture(false);
 
+	// FBO dimensions come from the per-eye JSON (loadParameters above). Fall
+	// back to the Config defaults if the file omits them (params default to
+	// 672x504, matching Config::fboSize).
+	config.fboSize.x = std::max(1, parameters.fboWidth.get());
+	config.fboSize.y = std::max(1, parameters.fboHeight.get());
 	const int w = config.fboSize.x;
 	const int h = config.fboSize.y;
 	targetFbo.allocate(w, h, GL_RGB);
@@ -445,20 +457,29 @@ void EyeCameraStream::renderTargetFbo() {
 	float drawX = 0.0f;
 	float drawY = 0.0f;
 	if (srcW > 0.0f && srcH > 0.0f) {
-		const float srcAspect = srcW / srcH;
-		const float fboAspect = fboW / fboH;
-		if (srcAspect > fboAspect) {
-			drawW = fboW;
-			drawH = fboW / srcAspect;
-		} else {
-			drawH = fboH;
-			drawW = fboH * srcAspect;
-		}
-		// Apply user-controlled view scale on top of the aspect-preserving fit.
-		// scale > 1 zooms in (image is cropped by the FBO); scale < 1 zooms out.
 		const float s = std::max(0.0001f, parameters.viewScale.get());
-		drawW *= s;
-		drawH *= s;
+		if (parameters.fitToFill.get()) {
+			// Aspect-preserving fit: shrink the whole camera frame to fit the
+			// FBO, then apply view scale as a multiplier on that baseline.
+			// scale > 1 zooms in (image is cropped by the FBO); scale < 1 zooms out.
+			const float srcAspect = srcW / srcH;
+			const float fboAspect = fboW / fboH;
+			if (srcAspect > fboAspect) {
+				drawW = fboW;
+				drawH = fboW / srcAspect;
+			} else {
+				drawH = fboH;
+				drawW = fboH * srcAspect;
+			}
+			drawW *= s;
+			drawH *= s;
+		} else {
+			// Exact camera scale: view scale is the literal camera pixel -> FBO
+			// pixel factor, so scale == 1.0 draws the frame at native resolution
+			// (one camera pixel per FBO pixel) regardless of FBO/camera aspect.
+			drawW = srcW * s;
+			drawH = srcH * s;
+		}
 		drawX = (fboW - drawW) * 0.5f;
 		drawY = (fboH - drawH) * 0.5f;
 
@@ -697,21 +718,24 @@ void EyeCameraStream::drawDebug(float x, float y, float w, float h) const {
 			drawH = lastLayout.h;
 		} else {
 			// Fallback for the very first frame, before renderTargetFbo has run:
-			// centered, scale-aware letterbox fit (matches the no-follow path).
-			const float srcAspect = srcW / srcH;
-			const float fboAspect = fboW / fboH;
-			drawW = fboW;
-			drawH = fboH;
-			if (srcAspect > fboAspect) {
-				drawW = fboW;
-				drawH = fboW / srcAspect;
-			} else {
-				drawH = fboH;
-				drawW = fboH * srcAspect;
-			}
+			// centered, scale-aware layout (matches the no-follow path).
 			const float s = std::max(0.0001f, parameters.viewScale.get());
-			drawW *= s;
-			drawH *= s;
+			if (parameters.fitToFill.get()) {
+				const float srcAspect = srcW / srcH;
+				const float fboAspect = fboW / fboH;
+				if (srcAspect > fboAspect) {
+					drawW = fboW;
+					drawH = fboW / srcAspect;
+				} else {
+					drawH = fboH;
+					drawW = fboH * srcAspect;
+				}
+				drawW *= s;
+				drawH *= s;
+			} else {
+				drawW = srcW * s;
+				drawH = srcH * s;
+			}
 			drawX = (fboW - drawW) * 0.5f;
 			drawY = (fboH - drawH) * 0.5f;
 		}
