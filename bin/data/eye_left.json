@@ -1,5 +1,5 @@
 {
-    "eye0": {
+    "left": {
         "ofxIdsPeak": {
             "exposure_auto": false,
             "exposure__us_": 16000.0,
@@ -53,6 +53,10 @@
         "fbo": {
             "width": 672,
             "height": 504
+        },
+        "camera": {
+            "select_by": "serial",
+            "value": "4108724653"
         }
     }
 }

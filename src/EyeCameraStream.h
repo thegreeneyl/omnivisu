@@ -112,6 +112,13 @@ private:
 		ofParameterGroup fboGroup{"fbo"};
 		ofParameter<int> fboWidth{"width", 672, 1, 8192};
 		ofParameter<int> fboHeight{"height", 504, 1, 8192};
+
+		// Which physical camera this eye binds to. Read from JSON at setup time
+		// and translated into the grabber's device selector before it opens.
+		// Startup-only, so not added to the runtime GUI.
+		ofParameterGroup cameraGroup{"camera"};
+		ofParameter<std::string> selectBy{"select by", "serial"};
+		ofParameter<std::string> selectValue{"value", ""};
 	};
 
 	struct FrameJob {

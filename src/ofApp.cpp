@@ -47,16 +47,30 @@ void ofApp::setup() {
 	ofSetVerticalSync(true);
 	ofBackground(0);
 
-	const std::array<std::string, 2> names = {"eye0", "eye1"};
-	for (const auto & name : names) {
+	appConfig.load("config.json");
+	maskMode = appConfig.startsInMaskMode();
+
+	// streams[0] is the LEFT eye, streams[1] the RIGHT eye. This positional
+	// mapping matches MaskLayout's left/right openings; each eye's JSON binds
+	// to a specific physical camera via its "camera" block.
+	struct EyeSpec {
+		std::string name;
+		std::string paramsFile;
+	};
+	const std::array<EyeSpec, 2> eyes = {{
+		{"left", "eye_left.json"},
+		{"right", "eye_right.json"},
+	}};
+	for (const auto & eye : eyes) {
 		EyeCameraStream::Config cfg;
-		cfg.name = name;
+		cfg.name = eye.name;
+		cfg.paramsFile = eye.paramsFile;
 		cfg.fboSize = {672, 504};
 		cfg.mirrorX = true;
 
 		auto stream = std::make_unique<EyeCameraStream>();
 		if (!stream->setup(cfg)) {
-			ofLogError("omnivisu") << "Failed to initialize " << name << " camera stream";
+			ofLogError("omnivisu") << "Failed to initialize " << eye.name << " camera stream";
 		}
 		streams.push_back(std::move(stream));
 	}
@@ -73,7 +87,7 @@ void ofApp::setup() {
 	}
 	layoutGuis();
 
-	maskLoaded = maskLayout.load("mask_layout.json");
+	maskLoaded = maskLayout.load(appConfig.getMaskJson());
 	if (!maskLoaded) {
 		ofLogWarning("omnivisu") << "mask layout not loaded; falling back to side-by-side view";
 		maskMode = false;
@@ -189,13 +203,12 @@ void ofApp::drawMasked() {
 	const MaskLayout::ScreenLayout sl = maskLayout.compute(ofGetWidth(), ofGetHeight());
 	const int n = static_cast<int>(streams.size());
 
-	const int leftIdx = maskLayout.getLeftStreamIndex();
-	const int rightIdx = maskLayout.getRightStreamIndex();
-	if (leftIdx >= 0 && leftIdx < n) {
-		drawStreamCover(*streams[leftIdx], sl.leftEyeScreen);
+	// Positional mapping: streams[0] = left eye, streams[1] = right eye.
+	if (n > 0) {
+		drawStreamCover(*streams[0], sl.leftEyeScreen);
 	}
-	if (rightIdx >= 0 && rightIdx < n) {
-		drawStreamCover(*streams[rightIdx], sl.rightEyeScreen);
+	if (n > 1) {
+		drawStreamCover(*streams[1], sl.rightEyeScreen);
 	}
 
 	ofEnableAlphaBlending();

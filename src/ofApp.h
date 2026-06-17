@@ -2,6 +2,7 @@
 
 #include "ofMain.h"
 #include "ofxGui.h"
+#include "AppConfig.h"
 #include "EyeCameraStream.h"
 #include "MaskLayout.h"
 
@@ -33,6 +34,7 @@ private:
 
 	std::vector<std::unique_ptr<EyeCameraStream>> streams;
 	std::vector<std::unique_ptr<ofxPanel>> guis;
+	AppConfig appConfig;
 	MaskLayout maskLayout;
 	bool maskMode = true;
 	bool maskLoaded = false;

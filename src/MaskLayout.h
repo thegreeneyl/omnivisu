@@ -17,9 +17,10 @@ public:
 		ofRectangle rightEyeScreen;
 	};
 
-	/// Loads the layout JSON and the referenced PNG. Returns false (and logs)
-	/// if the JSON is missing/unparseable or the image fails to load.
-	bool load(const std::string & path);
+	/// Loads the layout from the "mask" JSON block and the referenced PNG.
+	/// Returns false (and logs) if the JSON is empty or the image fails to load.
+	/// Left/right eyes map positionally to streams[0]/streams[1].
+	bool load(const ofJson & maskJson);
 
 	bool isLoaded() const { return loaded; }
 
@@ -30,16 +31,11 @@ public:
 	/// Draws the mask PNG full-screen using the supplied layout.
 	void drawMask(const ScreenLayout & layout) const;
 
-	int getLeftStreamIndex() const { return leftStreamIndex; }
-	int getRightStreamIndex() const { return rightStreamIndex; }
-
 private:
 	ofImage maskImage;
 	glm::ivec2 imageSize{4000, 4000};
 	glm::vec2 anchor{2000.0f, 2000.0f};
 	ofRectangle leftEye;
 	ofRectangle rightEye;
-	int leftStreamIndex = 0;
-	int rightStreamIndex = 1;
 	bool loaded = false;
 };

@@ -23,24 +23,11 @@ ofRectangle mapRect(const ofRectangle & src, float scale, float imgX, float imgY
 } // namespace
 
 //--------------------------------------------------------------
-bool MaskLayout::load(const std::string & path) {
+bool MaskLayout::load(const ofJson & json) {
 	loaded = false;
 
-	ofFile file(path);
-	if (!file.exists()) {
-		ofLogWarning("MaskLayout") << "layout file not found: " << path;
-		return false;
-	}
-
-	ofJson json;
-	try {
-		json = ofLoadJson(path);
-	} catch (const std::exception & e) {
-		ofLogError("MaskLayout") << "failed to parse " << path << ": " << e.what();
-		return false;
-	}
 	if (json.is_null() || json.empty()) {
-		ofLogError("MaskLayout") << "empty or invalid JSON: " << path;
+		ofLogError("MaskLayout") << "empty or missing mask config block";
 		return false;
 	}
 
@@ -63,13 +50,6 @@ bool MaskLayout::load(const std::string & path) {
 		ofRectangle(1030, 1073, 414, 280));
 	rightEye = readRect(json.value("right_eye", ofJson::object()),
 		ofRectangle(2551, 1071, 414, 280));
-
-	if (json.contains("left_eye")) {
-		leftStreamIndex = json["left_eye"].value("stream", leftStreamIndex);
-	}
-	if (json.contains("right_eye")) {
-		rightStreamIndex = json["right_eye"].value("stream", rightStreamIndex);
-	}
 
 	// Anchor defaults to the image center, then to JSON anchor if present.
 	anchor = glm::vec2(imageSize.x * 0.5f, imageSize.y * 0.5f);

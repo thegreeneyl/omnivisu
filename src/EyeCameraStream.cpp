@@ -8,6 +8,13 @@ float clamp01(float v) {
 	return std::max(0.0f, std::min(1.0f, v));
 }
 
+ofxIdsPeak::DeviceSelect deviceSelectFromString(const std::string & s) {
+	if (s == "serial") return ofxIdsPeak::DeviceSelect::Serial;
+	if (s == "model") return ofxIdsPeak::DeviceSelect::Model;
+	if (s == "index") return ofxIdsPeak::DeviceSelect::Index;
+	return ofxIdsPeak::DeviceSelect::Any;
+}
+
 float rectDistanceSq(const ofRectangle & a, const ofRectangle & b) {
 	const float ax = a.x + a.width * 0.5f;
 	const float ay = a.y + a.height * 0.5f;
@@ -62,6 +69,12 @@ void EyeCameraStream::setupParameters() {
 	parameters.fboGroup.add(parameters.fboWidth);
 	parameters.fboGroup.add(parameters.fboHeight);
 	parameters.group.add(parameters.fboGroup);
+
+	parameters.cameraGroup.clear();
+	parameters.cameraGroup.setName("camera");
+	parameters.cameraGroup.add(parameters.selectBy);
+	parameters.cameraGroup.add(parameters.selectValue);
+	parameters.group.add(parameters.cameraGroup);
 }
 
 //--------------------------------------------------------------
@@ -76,6 +89,21 @@ bool EyeCameraStream::setup(const Config & cfg) {
 	// Load tunable params from JSON before the grabber initializes so the
 	// camera comes up with the persisted exposure/gain/WB/etc. values.
 	loadParameters();
+
+	// Translate the JSON "camera" block into the grabber's device selector so
+	// this eye binds to a specific physical camera (by serial/model/index).
+	const ofxIdsPeak::DeviceSelect selectMode = deviceSelectFromString(parameters.selectBy.get());
+	const std::string selectValue = parameters.selectValue.get();
+	int selectIndex = 0;
+	if (selectMode == ofxIdsPeak::DeviceSelect::Index) {
+		try {
+			selectIndex = std::stoi(selectValue);
+		} catch (const std::exception &) {
+			ofLogWarning("EyeCameraStream") << config.name
+				<< ": camera select index '" << selectValue << "' is not an integer; using 0";
+		}
+	}
+	grabber.setDeviceSelector(selectMode, selectValue, selectIndex);
 
 	const bool grabberOk = grabber.setup();
 	if (!grabberOk) {
