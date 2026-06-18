@@ -33,6 +33,10 @@ bool AppConfig::load(const std::string & path) {
 		streaming.enabled = s.value("enabled", streaming.enabled);
 		streaming.targetIp = s.value("target_ip", streaming.targetIp);
 		streaming.targetPort = s.value("target_port", streaming.targetPort);
+		streaming.compression = s.value("compression", streaming.compression);
+		streaming.packetPayloadBytes = s.value("packet_payload_bytes", streaming.packetPayloadBytes);
+		streaming.fpsLimit = s.value("fps_limit", streaming.fpsLimit);
+		streaming.asyncReadback = s.value("async_readback", streaming.asyncReadback);
 	}
 
 	if (json.contains("mask")) {

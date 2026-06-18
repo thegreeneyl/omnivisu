@@ -237,7 +237,19 @@ bool EyeCameraStream::loadParameters() {
 		return false;
 	}
 	const ofJson json = ofLoadJson(path);
+	// At runtime the grabber's capture thread is live; a bulk ofDeserialize into
+	// the parameter group would fire every grabber listener (a storm of
+	// applyParameters() plus a reconfigureOutputFormat() buffer realloc) and
+	// crash. Bracket the write so the camera parameters are applied once, safely.
+	// During initial setup the grabber is not yet initialized, so this is a no-op.
+	const bool live = grabber.isInitialized();
+	if (live) {
+		grabber.beginParameterBatch();
+	}
 	ofDeserialize(json, parameters.group);
+	if (live) {
+		grabber.endParameterBatch();
+	}
 	ofLogNotice("EyeCameraStream") << config.name << ": params loaded from " << path;
 	return true;
 }

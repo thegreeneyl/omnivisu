@@ -9,7 +9,10 @@ namespace {
 /// Draws a stream's FBO into dst with a "cover" fit (preserve aspect, crop
 /// overflow) so the eye opening is fully filled with no distortion or
 /// background. GL scissor clips the cropped overflow to the eye rect.
-void drawStreamCover(const EyeCameraStream & stream, const ofRectangle & dst) {
+/// viewportHeight is the height of the current render target (window height
+/// when drawing to screen, FBO height when drawing into an FBO) and is used to
+/// flip dst.y into GL's bottom-left scissor origin.
+void drawStreamCover(const EyeCameraStream & stream, const ofRectangle & dst, float viewportHeight) {
 	const auto & fbo = stream.getTargetFbo();
 	if (!fbo.isAllocated() || dst.width <= 0.0f || dst.height <= 0.0f) {
 		return;
@@ -31,7 +34,7 @@ void drawStreamCover(const EyeCameraStream & stream, const ofRectangle & dst) {
 	glEnable(GL_SCISSOR_TEST);
 	// GL scissor origin is bottom-left, so flip the y of the dst rect.
 	glScissor(static_cast<GLint>(dst.x),
-		static_cast<GLint>(ofGetWindowHeight() - (dst.y + dst.height)),
+		static_cast<GLint>(viewportHeight - (dst.y + dst.height)),
 		static_cast<GLsizei>(dst.width),
 		static_cast<GLsizei>(dst.height));
 	fbo.draw(drawX, drawY, drawW, drawH);
@@ -92,6 +95,76 @@ void ofApp::setup() {
 		ofLogWarning("omnivisu") << "mask layout not loaded; falling back to side-by-side view";
 		maskMode = false;
 	}
+
+	applyStreamingConfig(appConfig.getStreaming());
+}
+
+//--------------------------------------------------------------
+void ofApp::applyStreamingConfig(const AppConfig::StreamingConfig & sc) {
+	streamingEnabled = sc.enabled;
+	if (!streamingEnabled) {
+		streamSender.close();
+		return;
+	}
+
+	// Combined stream FBO is a fixed 828x280 (independent of config), so only
+	// allocate it once.
+	if (!streamFbo.isAllocated()) {
+		ofFboSettings fboSettings;
+		fboSettings.width = kStreamWidth;
+		fboSettings.height = kStreamHeight;
+		fboSettings.internalformat = GL_RGB;
+		fboSettings.numSamples = 0;
+		fboSettings.useDepth = false;
+		fboSettings.useStencil = false;
+		streamFbo.allocate(fboSettings);
+		streamFbo.begin();
+		ofClear(0, 0, 0, 255);
+		streamFbo.end();
+	}
+
+	streamAsyncReadback = sc.asyncReadback;
+	streamFpsLimit = sc.fpsLimit;
+	if (!streamPixels.isAllocated()) {
+		streamPixels.allocate(kStreamWidth, kStreamHeight, OF_PIXELS_RGB);
+	}
+	if (streamAsyncReadback && !streamPbo[0].isAllocated()) {
+		const size_t bytes = static_cast<size_t>(kStreamWidth) * kStreamHeight * 3; // GL_RGB
+		streamPbo[0].allocate(bytes, GL_STREAM_READ);
+		streamPbo[1].allocate(bytes, GL_STREAM_READ);
+	}
+	streamPboIndex = 0;
+	streamPboPrimed = false;
+	nextStreamSampleTime = 0.0f;
+
+	EyeStreamSender::Config senderCfg;
+	senderCfg.targetIp = sc.targetIp;
+	senderCfg.targetPort = sc.targetPort;
+	senderCfg.compression = sc.compression;
+	senderCfg.packetPayloadBytes = sc.packetPayloadBytes;
+	senderCfg.fpsLimit = sc.fpsLimit;
+	if (!streamSender.setup(senderCfg)) {
+		ofLogError("omnivisu") << "failed to start eye stream sender";
+		streamingEnabled = false;
+	}
+}
+
+//--------------------------------------------------------------
+void ofApp::reloadConfig() {
+	appConfig.load("config.json");
+
+	// Re-apply display mode + mask layout from disk.
+	maskLoaded = maskLayout.load(appConfig.getMaskJson());
+	maskMode = appConfig.startsInMaskMode() && maskLoaded;
+	if (!maskLoaded) {
+		ofLogWarning("omnivisu") << "mask layout not loaded on reload; using side-by-side view";
+	}
+
+	// Re-apply streaming: this tears down and restarts the sender so changes to
+	// target ip/port, compression, payload size, fps cap, async readback, or the
+	// enabled flag all take effect immediately.
+	applyStreamingConfig(appConfig.getStreaming());
+	ofLogNotice("omnivisu") << "config.json reloaded";
 }
 
 //--------------------------------------------------------------
@@ -141,6 +214,12 @@ void ofApp::update() {
 				<< " hits=" << streams[i]->getValidDetectionCount()
 				<< " present=" << (r.present ? 1 : 0)
 				<< " conf=" << ofToString(r.confidence, 2);
+		}
+		if (streamCpuSamples > 0) {
+			msg << " | stream_cpu_us=" << static_cast<long>(streamCpuUsSum / streamCpuSamples)
+				<< " (n=" << streamCpuSamples << ", async=" << (streamAsyncReadback ? 1 : 0) << ")";
+			streamCpuUsSum = 0.0;
+			streamCpuSamples = 0;
 		}
 		ofLogNotice("omnivisu") << msg.str();
 		lastFpsLogTime = now;
@@ -194,6 +273,71 @@ void ofApp::draw() {
 		ofSetColor(255);
 		ofDrawBitmapString(ofToString(ofGetFrameRate(), 2), 20, ofGetHeight() - 20);
 	}
+
+	updateStream();
+}
+
+//--------------------------------------------------------------
+void ofApp::updateStream() {
+	if (!streamingEnabled || !streamFbo.isAllocated()) {
+		return;
+	}
+
+	// Decouple the expensive stream render+readback from the display rate. When
+	// capped, most display frames skip this work entirely so the window holds
+	// its full refresh rate.
+	if (streamFpsLimit > 0) {
+		const float now = ofGetElapsedTimef();
+		if (now < nextStreamSampleTime) {
+			return;
+		}
+		const float interval = 1.0f / static_cast<float>(streamFpsLimit);
+		nextStreamSampleTime += interval;
+		// If we fell more than one interval behind (e.g. after a stall), resync
+		// to "now" instead of bursting a catch-up sequence of frames.
+		if (nextStreamSampleTime < now) {
+			nextStreamSampleTime = now + interval;
+		}
+	}
+
+	const std::uint64_t streamStartUs = ofGetElapsedTimeMicros();
+	const int n = static_cast<int>(streams.size());
+	const float vpH = static_cast<float>(kStreamHeight);
+
+	streamFbo.begin();
+	ofClear(0, 0, 0, 255);
+	if (n > 0) {
+		drawStreamCover(*streams[0],
+			ofRectangle(0.0f, 0.0f, kStreamEyeWidth, kStreamHeight), vpH);
+	}
+	if (n > 1) {
+		drawStreamCover(*streams[1],
+			ofRectangle(kStreamEyeWidth, 0.0f, kStreamEyeWidth, kStreamHeight), vpH);
+	}
+	streamFbo.end();
+
+	if (streamAsyncReadback) {
+		glPixelStorei(GL_PACK_ALIGNMENT, 1);          // defensive; 828*3 is already 4-aligned
+		streamFbo.copyTo(streamPbo[streamPboIndex]);  // async glReadPixels into PBO, returns immediately
+
+		const int prev = 1 - streamPboIndex;
+		if (streamPboPrimed) {
+			unsigned char * p = streamPbo[prev].map<unsigned char>(GL_READ_ONLY);
+			if (p) {
+				memcpy(streamPixels.getData(), p, streamPixels.size());
+				streamPbo[prev].unmap();
+				streamSender.submit(streamPixels);
+			}
+		}
+		streamPboIndex = prev;
+		streamPboPrimed = true;
+	} else {
+		streamFbo.readToPixels(streamPixels);
+		streamSender.submit(streamPixels);
+	}
+
+	streamCpuUsSum += static_cast<double>(ofGetElapsedTimeMicros() - streamStartUs);
+	++streamCpuSamples;
 }
 
 //--------------------------------------------------------------
@@ -204,11 +348,12 @@ void ofApp::drawMasked() {
 	const int n = static_cast<int>(streams.size());
 
 	// Positional mapping: streams[0] = left eye, streams[1] = right eye.
+	const float vpH = static_cast<float>(ofGetWindowHeight());
 	if (n > 0) {
-		drawStreamCover(*streams[0], sl.leftEyeScreen);
+		drawStreamCover(*streams[0], sl.leftEyeScreen, vpH);
 	}
 	if (n > 1) {
-		drawStreamCover(*streams[1], sl.rightEyeScreen);
+		drawStreamCover(*streams[1], sl.rightEyeScreen, vpH);
 	}
 
 	ofEnableAlphaBlending();
@@ -217,6 +362,7 @@ void ofApp::drawMasked() {
 
 //--------------------------------------------------------------
 void ofApp::exit() {
+	streamSender.close();
 	streams.clear();
 }
 
@@ -238,6 +384,7 @@ void ofApp::keyPressed(int key) {
 		for (const auto & stream : streams) {
 			stream->loadParameters();
 		}
+		reloadConfig();
 	}
 }
 

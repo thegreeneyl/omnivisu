@@ -1,3 +1,4 @@
 ofxIdsPeak
 ofxGui
 ofxOpenCv
+ofxNetwork

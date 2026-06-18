@@ -13,6 +13,10 @@ public:
 		bool enabled = false;
 		std::string targetIp = "127.0.0.1";
 		int targetPort = 12345;
+		std::string compression = "none"; ///< "none" (raw RGB) or "jpeg".
+		int packetPayloadBytes = 1440;    ///< UDP payload chunk size (sans header).
+		int fpsLimit = 0;                 ///< Max send rate; 0 = unlimited.
+		bool asyncReadback = true;        ///< PBO async FBO readback (+1 frame latency, recovers fps).
 	};
 
 	/// Parses the given config file. Returns false (and logs) if the file is

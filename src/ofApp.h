@@ -1,9 +1,11 @@
 #pragma once
 
 #include "ofMain.h"
+#include "ofBufferObject.h"
 #include "ofxGui.h"
 #include "AppConfig.h"
 #include "EyeCameraStream.h"
+#include "EyeStreamSender.h"
 #include "MaskLayout.h"
 
 #include <memory>
@@ -31,6 +33,9 @@ public:
 private:
 	void layoutGuis();
 	void drawMasked();
+	void updateStream();
+	void applyStreamingConfig(const AppConfig::StreamingConfig & sc);
+	void reloadConfig();
 
 	std::vector<std::unique_ptr<EyeCameraStream>> streams;
 	std::vector<std::unique_ptr<ofxPanel>> guis;
@@ -41,4 +46,33 @@ private:
 	bool showGui = false;
 	bool showFps = false;
 	float lastFpsLogTime = 0.0f;
+
+	// Eye video streaming. The combined stream FBO holds the two eyes
+	// side-by-side (left half | right half), each cover-fit like the mask.
+	static constexpr int kStreamEyeWidth = 414;
+	static constexpr int kStreamHeight = 280;
+	static constexpr int kStreamWidth = kStreamEyeWidth * 2; // 828
+	bool streamingEnabled = false;
+	ofFbo streamFbo;
+	ofPixels streamPixels;
+	EyeStreamSender streamSender;
+
+	// Asynchronous FBO readback via double-buffered PBOs. Avoids the
+	// glReadPixels pipeline stall at the cost of one frame of latency.
+	bool streamAsyncReadback = true;
+	ofBufferObject streamPbo[2];
+	int streamPboIndex = 0;
+	bool streamPboPrimed = false;
+
+	// Cap how often the (GPU-side) stream render + readback runs, decoupled
+	// from the display frame rate. 0 = every frame. Lets the display hold
+	// 60fps while the stream samples at e.g. 30fps. nextStreamSampleTime is a
+	// fixed-grid schedule so the achieved rate approximates the target even
+	// when the display rate is not an exact multiple of it.
+	int streamFpsLimit = 0;
+	float nextStreamSampleTime = 0.0f;
+
+	// Rolling CPU cost of updateStream() for the per-second diagnostic log.
+	double streamCpuUsSum = 0.0;
+	int streamCpuSamples = 0;
 };

@@ -1,62 +1,62 @@
 {
     "left": {
-        "ofxIdsPeak": {
-            "exposure_auto": false,
-            "exposure__us_": 16000.0,
-            "gain_auto": false,
-            "gain": 4.0,
-            "gamma": 2.0,
-            "wb_auto": false,
-            "wb_red": 2.0,
-            "wb_green": 1.0,
-            "wb_blue": 2.0,
-            "fps_cap": 60.0,
-            "black_level": 0.0,
-            "reverse_x": false,
-            "reverse_y": false,
-            "saturation": 1.0,
-            "sharpness": 0.0,
-            "exposure_auto_upper__us_": 100000.0,
-            "exposure_auto_lower__us_": 50.0,
-            "gain_auto_upper": 16.0,
-            "gain_auto_lower": 1.0,
-            "processing_mode": 1,
-            "output_format": 1
-        },
-        "tracking": {
-            "enable_eye_tracking": true,
-            "show_debug_overlay": false,
-            "tracking_downscale": 8,
-            "haar_min_width": 400,
-            "haar_min_height": 250,
-            "haar_scale": 1.01,
-            "haar_neighbors": 5,
-            "present_on_frames": 4,
-            "present_off_frames": 10,
-            "euro_min_cutoff": 0.5,
-            "euro_beta": 0.007
-        },
-        "grading": {
-            "enable_grading": true,
-            "exposure__stops_": 0.0,
-            "brightness": 0.0,
-            "contrast": 1.6,
-            "gamma": 1.0,
-            "saturation": 1.0
-        },
-        "view": {
-            "scale": 1.0,
-            "fit_to_fill": false,
-            "follow_eye": true,
-            "follow_smoothing": 0.7
-        },
-        "fbo": {
-            "width": 672,
-            "height": 504
-        },
         "camera": {
             "select_by": "serial",
             "value": "4108724653"
+        },
+        "fbo": {
+            "height": "504",
+            "width": "672"
+        },
+        "grading": {
+            "brightness": "0",
+            "contrast": "1.6",
+            "enable_grading": "1",
+            "exposure__stops_": "0",
+            "gamma": "1",
+            "saturation": "1"
+        },
+        "ofxIdsPeak": {
+            "black_level": "0",
+            "exposure__us_": "16000",
+            "exposure_auto": "0",
+            "exposure_auto_lower__us_": "50",
+            "exposure_auto_upper__us_": "100000",
+            "fps_cap": "50",
+            "gain": "4",
+            "gain_auto": "0",
+            "gain_auto_lower": "1",
+            "gain_auto_upper": "16",
+            "gamma": "2",
+            "output_format": "1",
+            "processing_mode": "1",
+            "reverse_x": "0",
+            "reverse_y": "0",
+            "saturation": "1",
+            "sharpness": "0",
+            "wb_auto": "0",
+            "wb_blue": "2",
+            "wb_green": "1",
+            "wb_red": "2"
+        },
+        "tracking": {
+            "enable_eye_tracking": "1",
+            "euro_beta": "0.007",
+            "euro_min_cutoff": "0.5",
+            "haar_min_height": "250",
+            "haar_min_width": "400",
+            "haar_neighbors": "5",
+            "haar_scale": "1.01",
+            "present_off_frames": "10",
+            "present_on_frames": "4",
+            "show_debug_overlay": "0",
+            "tracking_downscale": "8"
+        },
+        "view": {
+            "fit_to_fill": "0",
+            "follow_eye": "1",
+            "follow_smoothing": "0.7",
+            "scale": "1"
         }
     }
 }
