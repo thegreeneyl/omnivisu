@@ -713,15 +713,67 @@ void EyeCameraStream::draw(float x, float y, float w, float h) const {
 
 //--------------------------------------------------------------
 void EyeCameraStream::drawDebug(float x, float y, float w, float h) const {
+	// The cropped eye-FBO view intentionally draws no detection overlay; the raw
+	// camera view (drawRawDebug) is the dedicated debug view that carries it.
 	draw(x, y, w, h);
+}
 
-	if (!parameters.showDebugOverlay) {
+//--------------------------------------------------------------
+void EyeCameraStream::drawRawDebug(float x, float y, float w, float h) {
+	const float srcW = grabber.getPixels().getWidth();
+	const float srcH = grabber.getPixels().getHeight();
+	if (srcW <= 0.0f || srcH <= 0.0f) {
+		ofPushStyle();
+		ofSetColor(255);
+		ofDrawBitmapString(config.name + " — waiting for camera", x + 20.0f, y + 20.0f);
+		ofPopStyle();
 		return;
 	}
 
-	const float srcW = grabber.getPixels().getWidth();
-	const float srcH = grabber.getPixels().getHeight();
-	if (srcW <= 0 || srcH <= 0) {
+	// Aspect-fit the *whole* camera frame into the destination rect (no eye
+	// follow / zoom), so this view shows the full graded sensor image with the
+	// detection overlay mapped in source-pixel space.
+	const float srcAspect = srcW / srcH;
+	const float dstAspect = (h > 0.0f) ? (w / h) : srcAspect;
+	float imgW = w;
+	float imgH = h;
+	if (srcAspect > dstAspect) {
+		imgW = w;
+		imgH = w / srcAspect;
+	} else {
+		imgH = h;
+		imgW = h * srcAspect;
+	}
+	const float imgX = x + (w - imgW) * 0.5f;
+	const float imgY = y + (h - imgH) * 0.5f;
+
+	if (grabber.getTexture().isAllocated()) {
+		ofPushStyle();
+		ofSetColor(255);
+		ofPushMatrix();
+		if (config.mirrorX) {
+			// Mirror horizontally within the fit rect so orientation matches the
+			// FBO view and the overlay's mirror-aware source->display mapping.
+			ofTranslate(imgX + imgX + imgW, 0.0f);
+			ofScale(-1.0f, 1.0f);
+		}
+		// Reuses the grade shader path so the raw view honours the same color
+		// grading as the cropped FBO view (or direct draw when grading is off).
+		drawCameraIntoFbo(imgX, imgY, imgW, imgH);
+		ofPopMatrix();
+		ofPopStyle();
+	}
+
+	if (parameters.showDebugOverlay) {
+		drawDetectionOverlay(x, y, imgX, imgY, imgW, imgH, srcW, srcH);
+	}
+}
+
+//--------------------------------------------------------------
+void EyeCameraStream::drawDetectionOverlay(float dispX, float dispY,
+		float imgX, float imgY, float imgW, float imgH,
+		float srcW, float srcH) const {
+	if (srcW <= 0.0f || srcH <= 0.0f) {
 		return;
 	}
 
@@ -737,56 +789,7 @@ void EyeCameraStream::drawDebug(float x, float y, float w, float h) const {
 	const std::uint64_t runs = detectionsRun.load();
 	const std::uint64_t hits = detectionsValid.load();
 
-	// The image is letterboxed inside the FBO, which is then drawn at (x, y, w, h).
-	// Compute the on-screen rect of the image itself so overlays map back to source pixels.
 	const bool mirror = config.mirrorX;
-	const float fboW = static_cast<float>(config.fboSize.x);
-	const float fboH = static_cast<float>(config.fboSize.y);
-
-	float imgX = x;
-	float imgY = y;
-	float imgW = w;
-	float imgH = h;
-	if (fboW > 0.0f && fboH > 0.0f) {
-		float drawX, drawY, drawW, drawH;
-		if (lastLayout.valid) {
-			// Use the same layout renderTargetFbo() applied, so the overlay
-			// follows the camera through scale and eye-follow shifts.
-			drawX = lastLayout.x;
-			drawY = lastLayout.y;
-			drawW = lastLayout.w;
-			drawH = lastLayout.h;
-		} else {
-			// Fallback for the very first frame, before renderTargetFbo has run:
-			// centered, scale-aware layout (matches the no-follow path).
-			const float s = std::max(0.0001f, parameters.viewScale.get());
-			if (parameters.fitToFill.get()) {
-				const float srcAspect = srcW / srcH;
-				const float fboAspect = fboW / fboH;
-				if (srcAspect > fboAspect) {
-					drawW = fboW;
-					drawH = fboW / srcAspect;
-				} else {
-					drawH = fboH;
-					drawW = fboH * srcAspect;
-				}
-				drawW *= s;
-				drawH *= s;
-			} else {
-				drawW = srcW * s;
-				drawH = srcH * s;
-			}
-			drawX = (fboW - drawW) * 0.5f;
-			drawY = (fboH - drawH) * 0.5f;
-		}
-		const float fboToDispX = w / fboW;
-		const float fboToDispY = h / fboH;
-		imgX = x + drawX * fboToDispX;
-		imgY = y + drawY * fboToDispY;
-		imgW = drawW * fboToDispX;
-		imgH = drawH * fboToDispY;
-	}
-
 	const float dispScaleX = imgW / srcW;
 	const float dispScaleY = imgH / srcH;
 
@@ -840,7 +843,7 @@ void EyeCameraStream::drawDebug(float x, float y, float w, float h) const {
 		ofSetColor(255, 255, 255, 230);
 		std::string boxInfo = "box " + ofToString((int)boxW) + "x" + ofToString((int)boxH)
 			+ "  center (" + ofToString((int)center.x) + "," + ofToString((int)center.y) + ")";
-		ofDrawBitmapStringHighlight(boxInfo, dispBoxX, std::max(y + 12.0f, dispBoxY - 6.0f));
+		ofDrawBitmapStringHighlight(boxInfo, dispBoxX, std::max(dispY + 12.0f, dispBoxY - 6.0f));
 	}
 
 	// Presence + worker heartbeat at the top of the displayed quad.
@@ -855,13 +858,13 @@ void EyeCameraStream::drawDebug(float x, float y, float w, float h) const {
 		state = snapLastRaw.valid ? "LOST (stale)" : "LOST";
 		ofSetColor(220, 60, 60, 230);
 	}
-	ofDrawBitmapStringHighlight(config.name + " : " + state, x + 6, y + 16);
+	ofDrawBitmapStringHighlight(config.name + " : " + state, dispX + 6, dispY + 16);
 
 	ofSetColor(255, 255, 0, 230);
 	std::string info = "worker runs=" + ofToString((unsigned long long)runs)
 		+ "  hits=" + ofToString((unsigned long long)hits)
 		+ "  conf=" + ofToString(snapResult.confidence, 2);
-	ofDrawBitmapStringHighlight(info, x + 6, y + 36);
+	ofDrawBitmapStringHighlight(info, dispX + 6, dispY + 36);
 
 	ofPopStyle();
 }

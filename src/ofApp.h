@@ -41,7 +41,10 @@ private:
 	std::vector<std::unique_ptr<ofxPanel>> guis;
 	AppConfig appConfig;
 	MaskLayout maskLayout;
-	bool maskMode = true;
+	// View cycled by the 'm' key: mask overlay -> cropped eye FBOs -> raw graded
+	// camera (each with the detection overlay where applicable).
+	enum class ViewMode { Mask, EyeFbo, RawCamera };
+	ViewMode viewMode = ViewMode::Mask;
 	bool maskLoaded = false;
 	bool showGui = false;
 	bool showFps = false;

@@ -18,7 +18,7 @@ because they only take effect when the stream is created.
 | Key | Action |
 | --- | --- |
 | `g` | Toggle the per-eye parameter GUI panels. |
-| `m` | Toggle between mask overlay and side-by-side view. |
+| `m` | Cycle the view: mask overlay -> cropped eye FBOs -> raw graded camera (full frame with detection overlay). |
 | `f` | Toggle the on-screen FPS readout. |
 | `s` | Save all eye parameters back to their JSON files. |
 | `r` | Reload all eye parameters from their JSON files. |

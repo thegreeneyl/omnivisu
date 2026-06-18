@@ -45,6 +45,9 @@ public:
 	void update();
 	void draw(float x, float y, float w, float h) const;
 	void drawDebug(float x, float y, float w, float h) const;
+	/// Draws the full (uncropped) graded camera frame aspect-fit into the rect,
+	/// with the detection overlay on top. Used by the raw side-by-side debug view.
+	void drawRawDebug(float x, float y, float w, float h);
 
 	const ofFbo & getTargetFbo() const { return targetFbo; }
 	Result getResult() const {
@@ -135,6 +138,12 @@ private:
 	void resetWorkerStateLocked();
 	bool buildGradeShader(bool useRect);
 	void drawCameraIntoFbo(float drawX, float drawY, float drawW, float drawH);
+	/// Shared detection overlay (box, center cross, presence/worker stats),
+	/// mapping source pixels into the given on-screen image rect. dispX/dispY is
+	/// the display-quad origin used for the state/heartbeat text.
+	void drawDetectionOverlay(float dispX, float dispY,
+		float imgX, float imgY, float imgW, float imgH,
+		float srcW, float srcH) const;
 	std::string paramsFilePath() const;
 
 	Config config;

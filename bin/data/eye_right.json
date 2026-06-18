@@ -49,8 +49,8 @@
             "haar_scale": "1.01",
             "present_off_frames": "10",
             "present_on_frames": "4",
-            "show_debug_overlay": "0",
-            "tracking_downscale": "8"
+            "show_debug_overlay": "1",
+            "tracking_downscale": "4"
         },
         "view": {
             "fit_to_fill": "0",

@@ -51,7 +51,7 @@ void ofApp::setup() {
 	ofBackground(0);
 
 	appConfig.load("config.json");
-	maskMode = appConfig.startsInMaskMode();
+	viewMode = appConfig.startsInMaskMode() ? ViewMode::Mask : ViewMode::EyeFbo;
 
 	// streams[0] is the LEFT eye, streams[1] the RIGHT eye. This positional
 	// mapping matches MaskLayout's left/right openings; each eye's JSON binds
@@ -93,7 +93,7 @@ void ofApp::setup() {
 	maskLoaded = maskLayout.load(appConfig.getMaskJson());
 	if (!maskLoaded) {
 		ofLogWarning("omnivisu") << "mask layout not loaded; falling back to side-by-side view";
-		maskMode = false;
+		viewMode = ViewMode::EyeFbo;
 	}
 
 	applyStreamingConfig(appConfig.getStreaming());
@@ -155,8 +155,10 @@ void ofApp::reloadConfig() {
 
 	// Re-apply display mode + mask layout from disk.
 	maskLoaded = maskLayout.load(appConfig.getMaskJson());
-	maskMode = appConfig.startsInMaskMode() && maskLoaded;
-	if (!maskLoaded) {
+	// Preserve the currently selected view across reloads; only drop out of the
+	// mask view if the mask layout is no longer available.
+	if (!maskLoaded && viewMode == ViewMode::Mask) {
+		viewMode = ViewMode::EyeFbo;
 		ofLogWarning("omnivisu") << "mask layout not loaded on reload; using side-by-side view";
 	}
 
@@ -232,7 +234,7 @@ void ofApp::draw() {
 	const float screenH = ofGetHeight();
 	const int n = static_cast<int>(streams.size());
 
-	if (maskMode && maskLoaded) {
+	if (viewMode == ViewMode::Mask && maskLoaded) {
 		drawMasked();
 	} else if (n == 0) {
 		ofSetColor(255);
@@ -241,7 +243,15 @@ void ofApp::draw() {
 		const float slotW = screenW / static_cast<float>(n);
 
 		for (int i = 0; i < n; ++i) {
-			const auto & stream = streams[i];
+			auto & stream = streams[i];
+
+			if (viewMode == ViewMode::RawCamera) {
+				// Full graded camera frame for the slot; the stream aspect-fits
+				// the whole sensor image and draws the detection overlay on top.
+				stream->drawRawDebug(slotW * static_cast<float>(i), 0.0f, slotW, screenH);
+				continue;
+			}
+
 			const glm::ivec2 fboSize = stream->getTargetFbo().getWidth() > 0
 				? glm::ivec2(stream->getTargetFbo().getWidth(), stream->getTargetFbo().getHeight())
 				: glm::ivec2(672, 504);
@@ -371,8 +381,19 @@ void ofApp::keyPressed(int key) {
 	if (key == 'g' || key == 'G') {
 		showGui = !showGui;
 	} else if (key == 'm' || key == 'M') {
-		if (maskLoaded) {
-			maskMode = !maskMode;
+		// Cycle: mask overlay -> cropped eye FBOs -> raw graded camera. Skip the
+		// mask view when no mask layout is loaded.
+		switch (viewMode) {
+		case ViewMode::Mask:
+			viewMode = ViewMode::EyeFbo;
+			break;
+		case ViewMode::EyeFbo:
+			viewMode = ViewMode::RawCamera;
+			break;
+		case ViewMode::RawCamera:
+		default:
+			viewMode = maskLoaded ? ViewMode::Mask : ViewMode::EyeFbo;
+			break;
 		}
 	} else if (key == 'f' || key == 'F') {
 		showFps = !showFps;
