@@ -137,17 +137,42 @@ Controls how the camera image is drawn into the FBO.
 
 ### `tracking`
 
-Haar eye detection and presence/smoothing behavior (runs on a worker thread).
+Eye detection and presence/smoothing behavior (runs on a worker thread). Three
+detectors are available, selected live via `detector_mode`:
+
+- **iris**: classical iris/limbus detection — grayscale, threshold the dark iris,
+  fit an ellipse, and gate candidates by the expected iris size. Yields the iris
+  center, radius and a fit-quality score. Tuned with the `iris_*` keys.
+- **haar**: the legacy Haar eye cascade, kept for A/B comparison. Tuned with the
+  `haar_*` keys.
+- **boxiris** (default): the Haar cascade supplies a stable eye-opening box, and
+  the iris detector runs *inside* each box; boxes without a valid iris are
+  discarded, which rejects the chin/ear/eyebrow false positives that plagued raw
+  Haar. `eyeBox`/center is the stable anchor (used for follow/display) and the
+  iris is located separately (gaze source). Uses both `haar_*` and `iris_*` keys.
+
+In `boxiris` mode both `haar_*` and `iris_*` keys apply. In `haar` mode only the
+`haar_*` keys matter; in `iris` mode only the `iris_*` keys matter.
 
 | Key | Type | Default | Range | Notes |
 | --- | --- | --- | --- | --- |
 | `enable_eye_tracking` | bool | `true` | — | Master on/off for detection. |
-| `show_debug_overlay` | bool | `true` | — | Draw the detection box, center cross, and worker stats. |
+| `show_debug_overlay` | bool | `true` | — | Draw the detection box/ellipse, center cross, active detector and worker stats (raw camera view only). |
+| `detector_mode` | int | `2` | 0 – 2 | `0` = iris/limbus, `1` = legacy Haar cascade, `2` = Haar box + iris inside (default). Switchable live for A/B comparison. |
 | `tracking_downscale` | int | `8` | 1 – 16 | Downsamples the worker's detection copy by this factor (display unaffected). Higher = faster, coarser. |
-| `haar_min_width` | int | `400` | 8 – 1000 | Minimum eye box width, in **source** pixels. |
-| `haar_min_height` | int | `250` | 8 – 1000 | Minimum eye box height, in **source** pixels. |
-| `haar_scale` | float | `1.01` | 1.001 – 1.5 | Cascade scale step. Closer to 1 = more thorough, slower. |
-| `haar_neighbors` | int | `5` | 0 – 20 | Cascade min-neighbors; higher = fewer false positives. |
+| `haar_min_width` | int | `400` | 8 – 1000 | (haar) Minimum eye box width, in **source** pixels. |
+| `haar_min_height` | int | `250` | 8 – 1000 | (haar) Minimum eye box height, in **source** pixels. |
+| `haar_scale` | float | `1.01` | 1.001 – 1.5 | (haar) Cascade scale step. Closer to 1 = more thorough, slower. |
+| `haar_neighbors` | int | `5` | 0 – 20 | (haar) Cascade min-neighbors; higher = fewer false positives. |
+| `iris_expected_radius` | int | `120` | 4 – 300 | (iris) Expected iris radius in **source** pixels. Drives the size gate that rejects chin/ear/eyebrow blobs. Tune using the ellipse overlay in the raw view. |
+| `iris_radius_tolerance` | float | `0.6` | 0.05 – 1.0 | (iris) Fractional band around the expected radius that a candidate may fall in (e.g. `0.6` = ±60%). |
+| `iris_threshold_mode` | int | `1` | 0 – 2 | (iris) Threshold method: `0` adaptive, `1` Otsu (auto), `2` fixed value. |
+| `iris_threshold` | int | `70` | 0 – 255 | (iris) Threshold value used when the mode is `2` (fixed). |
+| `iris_blur` | int | `5` | 1 – 31 | (iris) Gaussian blur kernel (px) before thresholding (forced odd). |
+| `iris_min_circularity` | float | `0.7` | 0.0 – 1.0 | (iris) Roundness gate: minor/major axis ratio a candidate must reach. `1.0` = only near-perfect circles, lower = allow more elongated ellipses. |
+| `iris_min_fit_quality` | float | `0.35` | 0.0 – 1.0 | (iris) Minimum ellipse fit quality (0..1) required to count as a valid detection. |
+| `iris_preferred_side` | int | `0` | 0 – 2 | (iris/boxiris) Picks which half the correct eye is on when both are visible: `0` none, `1` left, `2` right. This is a *dominant* preference — a detection on the chosen half is selected over the other half regardless of fit/temporal score; only when no detection exists on the chosen half does the other side win. The half is interpreted in **display** orientation (mirror-aware), so it matches what you see. |
+| `debug_show_candidates` | bool | `false` | — | Draw every candidate eye box (yellow) and iris ellipse (cyan), not just the chosen one, on the raw camera overlay. The `cand=Nb/Ni` label counts boxes/irises. Use it to see why a side preference picks a given eye. |
 | `present_on_frames` | int | `4` | 1 – 30 | Consecutive hits required to flip to PRESENT. |
 | `present_off_frames` | int | `10` | 1 – 60 | Consecutive misses required to flip to LOST. |
 | `euro_min_cutoff` | float | `0.5` | 0.01 – 5.0 | One Euro filter min cutoff (lower = smoother, more lag). |

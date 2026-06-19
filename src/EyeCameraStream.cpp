@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace {
+constexpr float kPi = 3.14159265358979323846f;
+
 float clamp01(float v) {
 	return std::max(0.0f, std::min(1.0f, v));
 }
@@ -35,11 +38,21 @@ void EyeCameraStream::setupParameters() {
 	parameters.trackingGroup.setName("tracking");
 	parameters.trackingGroup.add(parameters.enableEyeTracking);
 	parameters.trackingGroup.add(parameters.showDebugOverlay);
+	parameters.trackingGroup.add(parameters.detectorMode);
 	parameters.trackingGroup.add(parameters.trackingDownscale);
 	parameters.trackingGroup.add(parameters.haarMinWidth);
 	parameters.trackingGroup.add(parameters.haarMinHeight);
 	parameters.trackingGroup.add(parameters.haarScale);
 	parameters.trackingGroup.add(parameters.haarNeighbors);
+	parameters.trackingGroup.add(parameters.irisExpectedRadius);
+	parameters.trackingGroup.add(parameters.irisRadiusTolerance);
+	parameters.trackingGroup.add(parameters.irisThresholdMode);
+	parameters.trackingGroup.add(parameters.irisThreshold);
+	parameters.trackingGroup.add(parameters.irisBlur);
+	parameters.trackingGroup.add(parameters.irisMinFitQuality);
+	parameters.trackingGroup.add(parameters.irisMinCircularity);
+	parameters.trackingGroup.add(parameters.irisPreferredSide);
+	parameters.trackingGroup.add(parameters.debugShowCandidates);
 	parameters.trackingGroup.add(parameters.presentOnFrames);
 	parameters.trackingGroup.add(parameters.presentOffFrames);
 	parameters.trackingGroup.add(parameters.euroMinCutoff);
@@ -144,6 +157,10 @@ bool EyeCameraStream::setup(const Config & cfg) {
 	const float beta = parameters.euroBeta;
 	filterEyeX.setup(minCutoff, beta);
 	filterEyeY.setup(minCutoff, beta);
+	filterBoxW.setup(minCutoff, beta);
+	filterBoxH.setup(minCutoff, beta);
+	filterIrisX.setup(minCutoff, beta);
+	filterIrisY.setup(minCutoff, beta);
 
 	workerLastFrameTime = ofGetElapsedTimef();
 	lastFollowTime = workerLastFrameTime;
@@ -390,6 +407,20 @@ bool EyeCameraStream::detectEye(const ofPixels & pixels, RawDetection & out) {
 		cvGray.setFromPixels(*detectionInput);
 	}
 
+	// Dispatch to the selected detector. All operate on the prepared `cvGray`
+	// detection image and report results in source-pixel coordinates.
+	const int mode = parameters.detectorMode.get();
+	if (mode == 1) {
+		return detectHaar(downscale, srcW, srcH, out);
+	}
+	if (mode == 2) {
+		return detectEyeBoxIris(downscale, srcW, srcH, out);
+	}
+	return detectIris(downscale, out);
+}
+
+//--------------------------------------------------------------
+bool EyeCameraStream::detectHaar(int downscale, int srcW, int srcH, RawDetection & out) {
 	eyeFinder.setScaleHaar(parameters.haarScale);
 	eyeFinder.setNeighbors(parameters.haarNeighbors);
 
@@ -416,6 +447,10 @@ bool EyeCameraStream::detectEye(const ofPixels & pixels, RawDetection & out) {
 		}
 	}
 
+	for (const auto & blob : eyeFinder.blobs) {
+		out.candidateBoxes.push_back(blob.boundingRect); // debug overlay.
+	}
+
 	const ofxCvBlob eyeBlob = pickBestEyeBlob(eyeFinder.blobs);
 	if (eyeBlob.boundingRect.width <= 0.0f || eyeBlob.boundingRect.height <= 0.0f) {
 		return false;
@@ -432,6 +467,327 @@ bool EyeCameraStream::detectEye(const ofPixels & pixels, RawDetection & out) {
 	lastEyeBox = out.eyeBox;
 	hasLastEyeBox = true;
 	return true;
+}
+
+//--------------------------------------------------------------
+void EyeCameraStream::collectIrisCandidates(const cv::Mat & gray, int downscale,
+	float offX, float offY, std::vector<IrisCandidate> & out) const {
+	out.clear();
+	if (gray.empty() || gray.cols < 5 || gray.rows < 5) {
+		return;
+	}
+
+	int blurK = std::max(1, parameters.irisBlur.get());
+	if ((blurK % 2) == 0) {
+		++blurK; // Gaussian kernel size must be odd.
+	}
+	cv::Mat blurred;
+	if (blurK > 1) {
+		cv::GaussianBlur(gray, blurred, cv::Size(blurK, blurK), 0.0);
+	} else {
+		blurred = gray;
+	}
+
+	// The iris/limbus is darker than the surrounding sclera/skin, so we threshold
+	// the *dark* pixels (BINARY_INV) into blobs.
+	const float expectedDet = std::max(1.0f,
+		parameters.irisExpectedRadius.get() / static_cast<float>(std::max(1, downscale)));
+	cv::Mat bin;
+	const int tmode = parameters.irisThresholdMode.get();
+	if (tmode == 0) {
+		int block = std::max(3, static_cast<int>(expectedDet));
+		if ((block % 2) == 0) {
+			++block; // adaptiveThreshold block size must be odd.
+		}
+		// Block size must stay smaller than the (possibly small ROI) image.
+		const int maxBlock = (std::min(gray.cols, gray.rows) - 1) | 1;
+		block = std::max(3, std::min(block, maxBlock));
+		cv::adaptiveThreshold(blurred, bin, 255.0, cv::ADAPTIVE_THRESH_MEAN_C,
+			cv::THRESH_BINARY_INV, block, 5.0);
+	} else if (tmode == 1) {
+		cv::threshold(blurred, bin, 0.0, 255.0, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+	} else {
+		cv::threshold(blurred, bin, parameters.irisThreshold.get(), 255.0, cv::THRESH_BINARY_INV);
+	}
+
+	// Morphological open+close to drop specks and seal the iris blob. Kernel is a
+	// small fraction of the expected iris so it never erases the iris itself.
+	const int kn = std::max(1, static_cast<int>(expectedDet) / 8);
+	const cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE,
+		cv::Size(2 * kn + 1, 2 * kn + 1));
+	cv::morphologyEx(bin, bin, cv::MORPH_OPEN, kernel);
+	cv::morphologyEx(bin, bin, cv::MORPH_CLOSE, kernel);
+
+	std::vector<std::vector<cv::Point>> contours;
+	cv::findContours(bin, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+	if (contours.empty()) {
+		return;
+	}
+
+	const float tol = clamp01(parameters.irisRadiusTolerance.get());
+	const float minR = expectedDet * (1.0f - tol);
+	const float maxR = expectedDet * (1.0f + tol);
+	const float minArea = kPi * minR * minR * 0.3f;
+	const float s = static_cast<float>(downscale);
+
+	out.reserve(contours.size());
+	for (const auto & c : contours) {
+		if (c.size() < 5) {
+			continue; // fitEllipse requires at least 5 points.
+		}
+		const double area = cv::contourArea(c);
+		if (area < minArea) {
+			continue;
+		}
+		const cv::RotatedRect e = cv::fitEllipse(c);
+		const float a = e.size.width;
+		const float b = e.size.height;
+		if (a <= 0.0f || b <= 0.0f) {
+			continue;
+		}
+		const float rmean = (a + b) * 0.25f;
+		if (rmean < minR || rmean > maxR) {
+			continue; // fixed-scale size gate: kills chin/ear/eyebrow blobs.
+		}
+
+		// Roundness gate: reject elongated ellipses outright. aspect is the
+		// minor/major axis ratio (1 = perfect circle).
+		const float aspect = std::min(a, b) / std::max(a, b);
+		if (aspect < parameters.irisMinCircularity.get()) {
+			continue;
+		}
+
+		// Fit quality: how round (aspect), how compact (circularity), and how
+		// well the contour area matches its fitted ellipse area.
+		const double perim = cv::arcLength(c, true);
+		const float circ = (perim > 0.0)
+			? static_cast<float>(4.0 * kPi * area / (perim * perim))
+			: 0.0f;
+		const float ellipseArea = kPi * (a * 0.5f) * (b * 0.5f);
+		const float areaRatio = (ellipseArea > 0.0f)
+			? std::min(static_cast<float>(area), ellipseArea) / std::max(static_cast<float>(area), ellipseArea)
+			: 0.0f;
+		const float fitQuality = clamp01(0.4f * aspect + 0.3f * clamp01(circ) + 0.3f * areaRatio);
+
+		// Map ROI-local detection px -> full source px: (local + off) * downscale.
+		const float cxDet = e.center.x + offX;
+		const float cyDet = e.center.y + offY;
+		IrisCandidate cand;
+		cand.center = {cxDet * s, cyDet * s};
+		cand.size = {a * s, b * s};
+		cand.angleDeg = e.angle;
+		cand.radius = rmean * s;
+		cand.fitQuality = fitQuality;
+		cand.box = ofRectangle((cxDet - a * 0.5f) * s, (cyDet - b * 0.5f) * s, a * s, b * s);
+		out.push_back(cand);
+	}
+}
+
+//--------------------------------------------------------------
+bool EyeCameraStream::detectIris(int downscale, RawDetection & out) {
+	// `cvGray` holds the (downscaled) single-channel detection image. Wrap its
+	// pixels in a cv::Mat (no copy) for the OpenCV pipeline.
+	ofPixels & gp = cvGray.getPixels();
+	const int detW = static_cast<int>(gp.getWidth());
+	const int detH = static_cast<int>(gp.getHeight());
+	if (detW <= 0 || detH <= 0 || gp.getNumChannels() != 1 || gp.getData() == nullptr) {
+		return false;
+	}
+	cv::Mat gray(detH, detW, CV_8UC1, gp.getData());
+
+	std::vector<IrisCandidate> cands;
+	collectIrisCandidates(gray, downscale, 0.0f, 0.0f, cands);
+	out.candidateIris = cands; // debug overlay: show every candidate.
+	if (cands.empty()) {
+		return false;
+	}
+
+	const IrisCandidate best = pickBestIris(cands);
+	// Presence gate: require a confident-enough ellipse. The size band was
+	// already enforced above; preferred-side is folded into the scorer.
+	if (best.radius <= 0.0f || best.fitQuality < parameters.irisMinFitQuality.get()) {
+		return false;
+	}
+
+	out.eyeBox = best.box;
+	out.eyeCenter = best.center;
+	out.irisCenter = best.center;
+	out.irisSize = best.size;
+	out.irisAngleDeg = best.angleDeg;
+	out.irisRadiusPx = best.radius;
+	out.fitQuality = best.fitQuality;
+	out.confidence = best.fitQuality;
+	out.valid = true;
+
+	lastEyeBox = out.eyeBox;
+	hasLastEyeBox = true;
+	return true;
+}
+
+//--------------------------------------------------------------
+bool EyeCameraStream::detectEyeBoxIris(int downscale, int srcW, int srcH, RawDetection & out) {
+	// 1. Haar gives candidate eye-opening boxes (in detection px).
+	eyeFinder.setScaleHaar(parameters.haarScale);
+	eyeFinder.setNeighbors(parameters.haarNeighbors);
+	const int minW = std::max(1, parameters.haarMinWidth.get() / downscale);
+	const int minH = std::max(1, parameters.haarMinHeight.get() / downscale);
+	const int n = eyeFinder.findHaarObjects(cvGray, minW, minH);
+	if (n <= 0 || eyeFinder.blobs.empty()) {
+		return false;
+	}
+
+	ofPixels & gp = cvGray.getPixels();
+	const int detW = static_cast<int>(gp.getWidth());
+	const int detH = static_cast<int>(gp.getHeight());
+	if (detW <= 0 || detH <= 0 || gp.getNumChannels() != 1 || gp.getData() == nullptr) {
+		return false;
+	}
+	cv::Mat gray(detH, detW, CV_8UC1, gp.getData());
+
+	const float s = static_cast<float>(downscale);
+	const ofRectangle frame(0, 0, srcW, srcH);
+	const float frameDiagSq = frame.width * frame.width + frame.height * frame.height;
+
+	// 2. For each box, locate the best iris inside it. Boxes without a valid
+	// iris are discarded - this is what removes chin/ear/eyebrow false positives.
+	bool found = false;
+	float bestScore = -std::numeric_limits<float>::max();
+	RawDetection bestOut;
+	std::vector<IrisCandidate> cands;
+	std::vector<ofRectangle> allBoxes;   // debug: every Haar box considered.
+	std::vector<IrisCandidate> allIris;  // debug: every iris ellipse found.
+	for (const auto & blob : eyeFinder.blobs) {
+		// Clamp the Haar box to the detection image before cropping the ROI.
+		int rx = static_cast<int>(std::floor(blob.boundingRect.x));
+		int ry = static_cast<int>(std::floor(blob.boundingRect.y));
+		int rw = static_cast<int>(std::ceil(blob.boundingRect.width));
+		int rh = static_cast<int>(std::ceil(blob.boundingRect.height));
+		rx = std::max(0, std::min(rx, detW - 1));
+		ry = std::max(0, std::min(ry, detH - 1));
+		rw = std::max(1, std::min(rw, detW - rx));
+		rh = std::max(1, std::min(rh, detH - ry));
+		if (rw < 5 || rh < 5) {
+			continue;
+		}
+
+		// Eye box + its center in source px (the stable anchor).
+		const ofRectangle eyeBox(blob.boundingRect.x * s, blob.boundingRect.y * s,
+			blob.boundingRect.width * s, blob.boundingRect.height * s);
+		const glm::vec2 boxCenter(eyeBox.x + eyeBox.width * 0.5f,
+			eyeBox.y + eyeBox.height * 0.5f);
+		allBoxes.push_back(eyeBox);
+
+		const cv::Mat roi = gray(cv::Rect(rx, ry, rw, rh));
+		collectIrisCandidates(roi, downscale, static_cast<float>(rx), static_cast<float>(ry), cands);
+		allIris.insert(allIris.end(), cands.begin(), cands.end());
+		if (cands.empty()) {
+			continue;
+		}
+
+		const IrisCandidate iris = pickBestIris(cands);
+		if (iris.radius <= 0.0f || iris.fitQuality < parameters.irisMinFitQuality.get()) {
+			continue; // no valid iris in this box -> reject the box.
+		}
+
+		// 3. Score the (box, iris) pair: iris confidence + box temporal proximity,
+		// with the preferred side as a dominant, near-hard preference so the
+		// correct eye wins when two are in frame.
+		float temporalScore = 0.0f;
+		if (hasLastEyeBox) {
+			const float distNorm = rectDistanceSq(eyeBox, lastEyeBox) / std::max(1.0f, frameDiagSq);
+			temporalScore = 1.0f - clamp01(distNorm * 4.0f);
+		}
+		const float sidePenalty = onPreferredSide(boxCenter.x, frame.width) ? 0.0f : -10.0f;
+		const float score = iris.fitQuality * 0.6f
+			+ temporalScore * 0.4f
+			+ sidePenalty;
+
+		if (score > bestScore) {
+			bestScore = score;
+			bestOut = {};
+			bestOut.eyeBox = eyeBox;
+			bestOut.eyeCenter = boxCenter;
+			bestOut.irisCenter = iris.center;
+			bestOut.irisSize = iris.size;
+			bestOut.irisAngleDeg = iris.angleDeg;
+			bestOut.irisRadiusPx = iris.radius;
+			bestOut.fitQuality = iris.fitQuality;
+			bestOut.confidence = iris.fitQuality;
+			bestOut.valid = true;
+			found = true;
+		}
+	}
+
+	// Always publish the candidate lists for the debug overlay, even when no box
+	// survived the gates, so the user can see what was rejected.
+	if (!found) {
+		out.candidateBoxes = std::move(allBoxes);
+		out.candidateIris = std::move(allIris);
+		return false;
+	}
+
+	out = bestOut;
+	out.candidateBoxes = std::move(allBoxes);
+	out.candidateIris = std::move(allIris);
+	lastEyeBox = out.eyeBox;
+	hasLastEyeBox = true;
+	return true;
+}
+
+//--------------------------------------------------------------
+EyeCameraStream::IrisCandidate EyeCameraStream::pickBestIris(
+	const std::vector<IrisCandidate> & cands) const {
+	if (cands.empty()) {
+		return {};
+	}
+
+	const ofRectangle frame(0, 0, grabber.getPixels().getWidth(), grabber.getPixels().getHeight());
+	const float frameDiagSq = frame.width * frame.width + frame.height * frame.height;
+	const float expected = std::max(1.0f, static_cast<float>(parameters.irisExpectedRadius.get()));
+
+	IrisCandidate best = cands.front();
+	float bestScore = -std::numeric_limits<float>::max();
+	for (const auto & c : cands) {
+		// Size closeness: 1 when the radius matches the expected iris radius.
+		const float sizeScore = clamp01(1.0f - std::abs(c.radius - expected) / std::max(1.0f, expected));
+
+		float temporalScore = 0.0f;
+		if (hasLastEyeBox) {
+			const float distNorm = rectDistanceSq(c.box, lastEyeBox) / std::max(1.0f, frameDiagSq);
+			temporalScore = 1.0f - clamp01(distNorm * 4.0f);
+		}
+
+		// Preferred side acts as a dominant, near-hard preference: a candidate on
+		// the wrong half is pushed far below any right-half candidate, so the
+		// chosen eye flips reliably when two are visible. Among same-side
+		// candidates, size + fit + temporal proximity still decide.
+		const float sidePenalty = onPreferredSide(c.center.x, frame.width) ? 0.0f : -10.0f;
+
+		const float score = sizeScore * 0.40f
+			+ c.fitQuality * 0.30f
+			+ temporalScore * 0.30f
+			+ sidePenalty;
+		if (score > bestScore) {
+			bestScore = score;
+			best = c;
+		}
+	}
+
+	return best;
+}
+
+//--------------------------------------------------------------
+bool EyeCameraStream::onPreferredSide(float srcX, float srcW) const {
+	const int side = parameters.irisPreferredSide.get();
+	if (side == 0) {
+		return true; // no preference: every candidate qualifies.
+	}
+	// Detection runs on the non-mirrored source, but the user picks a side based
+	// on the (possibly mirrored) display. Convert to a displayed [0,1] x so the
+	// preference matches what they see.
+	const float nx = (srcW > 0.0f) ? srcX / srcW : 0.5f;
+	const float dispNx = config.mirrorX ? (1.0f - nx) : nx;
+	return (side == 1) ? (dispNx < 0.5f) : (dispNx >= 0.5f);
 }
 
 //--------------------------------------------------------------
@@ -461,21 +817,45 @@ void EyeCameraStream::applySmoothing(const RawDetection & raw, float dt) {
 	// Otherwise we keep the last good values so the overlay doesn't collapse
 	// to (0,0) during transient detection misses.
 	if (raw.valid) {
-		result.eyeBox = raw.eyeBox;
 		result.detectedEyeWidthPx = raw.eyeBox.width;
 		result.confidence = raw.confidence;
+		result.irisSize = raw.irisSize;
+		result.irisAngleDeg = raw.irisAngleDeg;
+		result.irisRadiusPx = raw.irisRadiusPx;
+		result.fitQuality = raw.fitQuality;
+
+		// The eye anchor is the box *center*; smoothing the center plus the box
+		// size (rather than copying raw.eyeBox) gives a rock-steady anchor while
+		// the iris stays free to move with gaze.
+		const float rawBoxCx = raw.eyeBox.x + raw.eyeBox.width * 0.5f;
+		const float rawBoxCy = raw.eyeBox.y + raw.eyeBox.height * 0.5f;
 
 		if (presentSmoothed && !presentSmoothedPrev) {
-			filterEyeX.reset(raw.eyeCenter.x);
-			filterEyeY.reset(raw.eyeCenter.y);
+			filterEyeX.reset(rawBoxCx);
+			filterEyeY.reset(rawBoxCy);
+			filterBoxW.reset(raw.eyeBox.width);
+			filterBoxH.reset(raw.eyeBox.height);
+			filterIrisX.reset(raw.irisCenter.x);
+			filterIrisY.reset(raw.irisCenter.y);
 		}
 
+		float cx = rawBoxCx;
+		float cy = rawBoxCy;
+		float bw = raw.eyeBox.width;
+		float bh = raw.eyeBox.height;
+		glm::vec2 iris = raw.irisCenter;
 		if (presentSmoothed) {
-			result.eyeCenter.x = filterEyeX.filter(raw.eyeCenter.x, dt);
-			result.eyeCenter.y = filterEyeY.filter(raw.eyeCenter.y, dt);
-		} else {
-			result.eyeCenter = raw.eyeCenter;
+			cx = filterEyeX.filter(rawBoxCx, dt);
+			cy = filterEyeY.filter(rawBoxCy, dt);
+			bw = filterBoxW.filter(raw.eyeBox.width, dt);
+			bh = filterBoxH.filter(raw.eyeBox.height, dt);
+			iris.x = filterIrisX.filter(raw.irisCenter.x, dt);
+			iris.y = filterIrisY.filter(raw.irisCenter.y, dt);
 		}
+
+		result.eyeCenter = {cx, cy};
+		result.eyeBox = ofRectangle(cx - bw * 0.5f, cy - bh * 0.5f, bw, bh);
+		result.irisCenter = iris;
 	}
 
 	presentSmoothedPrev = presentSmoothed;
@@ -652,6 +1032,10 @@ void EyeCameraStream::threadedFunction() {
 		const float beta = std::max(0.0f, parameters.euroBeta.get());
 		filterEyeX.setParams(minCutoff, beta);
 		filterEyeY.setParams(minCutoff, beta);
+		filterBoxW.setParams(minCutoff, beta);
+		filterBoxH.setParams(minCutoff, beta);
+		filterIrisX.setParams(minCutoff, beta);
+		filterIrisY.setParams(minCutoff, beta);
 
 		RawDetection raw;
 		detectEye(job.pixels, raw);
@@ -806,6 +1190,33 @@ void EyeCameraStream::drawDetectionOverlay(float dispX, float dispY,
 
 	ofPushStyle();
 
+	// Debug: every candidate box (yellow) and iris ellipse (cyan) considered this
+	// frame, including rejected ones. The chosen box/iris is drawn solid below.
+	if (trackingOn && parameters.debugShowCandidates.get()) {
+		ofNoFill();
+		ofSetLineWidth(1.0f);
+		ofSetColor(255, 230, 0, 130);
+		for (const auto & b : snapLastRaw.candidateBoxes) {
+			const float bx = mirror ? (srcW - (b.x + b.width)) : b.x;
+			ofDrawRectangle(imgX + bx * dispScaleX, imgY + b.y * dispScaleY,
+				b.width * dispScaleX, b.height * dispScaleY);
+		}
+		ofSetColor(0, 230, 255, 150);
+		for (const auto & ic : snapLastRaw.candidateIris) {
+			if (ic.size.x <= 0.0f || ic.size.y <= 0.0f) {
+				continue;
+			}
+			const float ecx = mapSrcToDispX(ic.center.x);
+			const float ecy = mapSrcToDispY(ic.center.y);
+			const float eang = mirror ? -ic.angleDeg : ic.angleDeg;
+			ofPushMatrix();
+			ofTranslate(ecx, ecy);
+			ofRotateDeg(eang);
+			ofDrawEllipse(0.0f, 0.0f, ic.size.x * dispScaleX, ic.size.y * dispScaleY);
+			ofPopMatrix();
+		}
+	}
+
 	if (haveDetection) {
 		const ofRectangle & box = snapResult.eyeBox.width > 0 ? snapResult.eyeBox : snapLastRaw.eyeBox;
 		const glm::vec2 center = (snapResult.eyeBox.width > 0)
@@ -840,6 +1251,39 @@ void EyeCameraStream::drawDetectionOverlay(float dispX, float dispY,
 		ofDrawLine(dispCenterX - cross, dispCenterY, dispCenterX + cross, dispCenterY);
 		ofDrawLine(dispCenterX, dispCenterY - cross, dispCenterX, dispCenterY + cross);
 
+		// Fitted iris ellipse (iris detector only; haar leaves irisRadiusPx == 0).
+		const bool useResIris = snapResult.irisRadiusPx > 0.0f;
+		const float irisR = useResIris ? snapResult.irisRadiusPx : snapLastRaw.irisRadiusPx;
+		const glm::vec2 irisSz = useResIris ? snapResult.irisSize : snapLastRaw.irisSize;
+		const float irisAng = useResIris ? snapResult.irisAngleDeg : snapLastRaw.irisAngleDeg;
+		const glm::vec2 irisC = useResIris ? snapResult.irisCenter : snapLastRaw.irisCenter;
+		if (irisR > 0.0f && irisSz.x > 0.0f && irisSz.y > 0.0f) {
+			const float ecx = mapSrcToDispX(irisC.x);
+			const float ecy = mapSrcToDispY(irisC.y);
+			const float ew = irisSz.x * dispScaleX;
+			const float eh = irisSz.y * dispScaleY;
+			// Mirroring flips the apparent rotation direction.
+			const float eang = mirror ? -irisAng : irisAng;
+			ofSetColor(80, 180, 255, 230);
+			ofPushMatrix();
+			ofTranslate(ecx, ecy);
+			ofRotateDeg(eang);
+			ofNoFill();
+			ofSetLineWidth(2.0f);
+			ofDrawEllipse(0.0f, 0.0f, ew, eh);
+			ofPopMatrix();
+
+			// Iris-center dot and a faint line from the eye-box center to the
+			// iris center: a live preview of the future gaze vector.
+			ofSetColor(80, 180, 255, 120);
+			ofSetLineWidth(1.0f);
+			ofDrawLine(dispCenterX, dispCenterY, ecx, ecy);
+			ofFill();
+			ofSetColor(80, 180, 255, 230);
+			ofDrawCircle(ecx, ecy, 3.0f);
+			ofNoFill();
+		}
+
 		ofSetColor(255, 255, 255, 230);
 		std::string boxInfo = "box " + ofToString((int)boxW) + "x" + ofToString((int)boxH)
 			+ "  center (" + ofToString((int)center.x) + "," + ofToString((int)center.y) + ")";
@@ -861,7 +1305,14 @@ void EyeCameraStream::drawDetectionOverlay(float dispX, float dispY,
 	ofDrawBitmapStringHighlight(config.name + " : " + state, dispX + 6, dispY + 16);
 
 	ofSetColor(255, 255, 0, 230);
-	std::string info = "worker runs=" + ofToString((unsigned long long)runs)
+	const int dmode = parameters.detectorMode.get();
+	const char * detName = (dmode == 1) ? "haar" : (dmode == 2) ? "boxiris" : "iris";
+	const float fitShown = snapResult.fitQuality > 0.0f ? snapResult.fitQuality : snapLastRaw.fitQuality;
+	std::string info = std::string("det=") + detName
+		+ "  fit=" + ofToString(fitShown, 2)
+		+ "  cand=" + ofToString((unsigned)snapLastRaw.candidateBoxes.size())
+		+ "b/" + ofToString((unsigned)snapLastRaw.candidateIris.size()) + "i"
+		+ "  runs=" + ofToString((unsigned long long)runs)
 		+ "  hits=" + ofToString((unsigned long long)hits)
 		+ "  conf=" + ofToString(snapResult.confidence, 2);
 	ofDrawBitmapStringHighlight(info, dispX + 6, dispY + 36);

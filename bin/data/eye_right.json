@@ -40,6 +40,8 @@
             "wb_red": "2"
         },
         "tracking": {
+            "debug_show_candidates": "0",
+            "detector_mode": "2",
             "enable_eye_tracking": "1",
             "euro_beta": "0.007",
             "euro_min_cutoff": "0.5",
@@ -47,6 +49,14 @@
             "haar_min_width": "400",
             "haar_neighbors": "5",
             "haar_scale": "1.01",
+            "iris_blur": "5",
+            "iris_expected_radius": "120",
+            "iris_min_circularity": "0.7",
+            "iris_min_fit_quality": "0.35",
+            "iris_preferred_side": "0",
+            "iris_radius_tolerance": "0.6",
+            "iris_threshold": "70",
+            "iris_threshold_mode": "0",
             "present_off_frames": "10",
             "present_on_frames": "4",
             "show_debug_overlay": "1",

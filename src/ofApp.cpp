@@ -215,7 +215,8 @@ void ofApp::update() {
 				<< " worker_runs=" << streams[i]->getDetectionCount()
 				<< " hits=" << streams[i]->getValidDetectionCount()
 				<< " present=" << (r.present ? 1 : 0)
-				<< " conf=" << ofToString(r.confidence, 2);
+				<< " conf=" << ofToString(r.confidence, 2)
+				<< " fit=" << ofToString(r.fitQuality, 2);
 		}
 		if (streamCpuSamples > 0) {
 			msg << " | stream_cpu_us=" << static_cast<long>(streamCpuUsSum / streamCpuSamples)
