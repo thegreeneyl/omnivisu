@@ -51,7 +51,10 @@ void EyeCameraStream::setupParameters() {
 	parameters.trackingGroup.add(parameters.irisBlur);
 	parameters.trackingGroup.add(parameters.irisMinFitQuality);
 	parameters.trackingGroup.add(parameters.irisMinCircularity);
+	parameters.trackingGroup.add(parameters.irisMinDarkness);
 	parameters.trackingGroup.add(parameters.irisPreferredSide);
+	parameters.trackingGroup.add(parameters.eyeCenterOffsetX);
+	parameters.trackingGroup.add(parameters.eyeCenterOffsetY);
 	parameters.trackingGroup.add(parameters.debugShowCandidates);
 	parameters.trackingGroup.add(parameters.presentOnFrames);
 	parameters.trackingGroup.add(parameters.presentOffFrames);
@@ -569,6 +572,38 @@ void EyeCameraStream::collectIrisCandidates(const cv::Mat & gray, int downscale,
 			: 0.0f;
 		const float fitQuality = clamp01(0.4f * aspect + 0.3f * clamp01(circ) + 0.3f * areaRatio);
 
+		// Darkness check: an iris/pupil is darker than the surrounding eyeball.
+		// Compare the mean intensity of the ellipse interior against a ring just
+		// outside it, excluding near-saturated (specular highlight) pixels so a
+		// glint inside the pupil can't brighten the interior. This is what stops
+		// the detector from latching onto reflections that merely look round.
+		float darkness = 0.0f;
+		{
+			constexpr double kHighlightCutoff = 245.0; // ignore specular glints.
+			cv::Mat innerMask = cv::Mat::zeros(blurred.size(), CV_8UC1);
+			cv::ellipse(innerMask, cv::RotatedRect(e.center, cv::Size2f(a * 0.7f, b * 0.7f), e.angle),
+				cv::Scalar(255), -1);
+			cv::Mat irisMask = cv::Mat::zeros(blurred.size(), CV_8UC1);
+			cv::ellipse(irisMask, e, cv::Scalar(255), -1);
+			cv::Mat outerMask = cv::Mat::zeros(blurred.size(), CV_8UC1);
+			cv::ellipse(outerMask, cv::RotatedRect(e.center, cv::Size2f(a * 1.8f, b * 1.8f), e.angle),
+				cv::Scalar(255), -1);
+			cv::Mat ringMask = outerMask & ~irisMask;
+
+			cv::Mat notHighlight = blurred < kHighlightCutoff;
+			const cv::Mat innerValid = innerMask & notHighlight;
+			const cv::Mat ringValid = ringMask & notHighlight;
+			if (cv::countNonZero(innerValid) > 0 && cv::countNonZero(ringValid) > 0) {
+				const double innerMean = cv::mean(blurred, innerValid)[0];
+				const double ringMean = cv::mean(blurred, ringValid)[0];
+				// Normalize so ~128 gray levels of margin maps to 1.0.
+				darkness = clamp01(static_cast<float>(ringMean - innerMean) / 128.0f);
+			}
+		}
+		if (darkness < parameters.irisMinDarkness.get()) {
+			continue; // interior not darker than surroundings -> likely a reflection.
+		}
+
 		// Map ROI-local detection px -> full source px: (local + off) * downscale.
 		const float cxDet = e.center.x + offX;
 		const float cyDet = e.center.y + offY;
@@ -576,6 +611,7 @@ void EyeCameraStream::collectIrisCandidates(const cv::Mat & gray, int downscale,
 		cand.center = {cxDet * s, cyDet * s};
 		cand.size = {a * s, b * s};
 		cand.angleDeg = e.angle;
+		cand.darkness = darkness;
 		cand.radius = rmean * s;
 		cand.fitQuality = fitQuality;
 		cand.box = ofRectangle((cxDet - a * 0.5f) * s, (cyDet - b * 0.5f) * s, a * s, b * s);
@@ -616,6 +652,7 @@ bool EyeCameraStream::detectIris(int downscale, RawDetection & out) {
 	out.irisAngleDeg = best.angleDeg;
 	out.irisRadiusPx = best.radius;
 	out.fitQuality = best.fitQuality;
+	out.darkness = best.darkness;
 	out.confidence = best.fitQuality;
 	out.valid = true;
 
@@ -698,8 +735,9 @@ bool EyeCameraStream::detectEyeBoxIris(int downscale, int srcW, int srcH, RawDet
 			temporalScore = 1.0f - clamp01(distNorm * 4.0f);
 		}
 		const float sidePenalty = onPreferredSide(boxCenter.x, frame.width) ? 0.0f : -10.0f;
-		const float score = iris.fitQuality * 0.6f
-			+ temporalScore * 0.4f
+		const float score = iris.fitQuality * 0.4f
+			+ iris.darkness * 0.3f
+			+ temporalScore * 0.3f
 			+ sidePenalty;
 
 		if (score > bestScore) {
@@ -712,6 +750,7 @@ bool EyeCameraStream::detectEyeBoxIris(int downscale, int srcW, int srcH, RawDet
 			bestOut.irisAngleDeg = iris.angleDeg;
 			bestOut.irisRadiusPx = iris.radius;
 			bestOut.fitQuality = iris.fitQuality;
+			bestOut.darkness = iris.darkness;
 			bestOut.confidence = iris.fitQuality;
 			bestOut.valid = true;
 			found = true;
@@ -763,9 +802,10 @@ EyeCameraStream::IrisCandidate EyeCameraStream::pickBestIris(
 		// candidates, size + fit + temporal proximity still decide.
 		const float sidePenalty = onPreferredSide(c.center.x, frame.width) ? 0.0f : -10.0f;
 
-		const float score = sizeScore * 0.40f
-			+ c.fitQuality * 0.30f
-			+ temporalScore * 0.30f
+		const float score = sizeScore * 0.25f
+			+ c.fitQuality * 0.25f
+			+ c.darkness * 0.25f
+			+ temporalScore * 0.25f
 			+ sidePenalty;
 		if (score > bestScore) {
 			bestScore = score;
@@ -826,9 +866,13 @@ void EyeCameraStream::applySmoothing(const RawDetection & raw, float dt) {
 
 		// The eye anchor is the box *center*; smoothing the center plus the box
 		// size (rather than copying raw.eyeBox) gives a rock-steady anchor while
-		// the iris stays free to move with gaze.
-		const float rawBoxCx = raw.eyeBox.x + raw.eyeBox.width * 0.5f;
-		const float rawBoxCy = raw.eyeBox.y + raw.eyeBox.height * 0.5f;
+		// the iris stays free to move with gaze. A manual per-eye offset (source
+		// px) corrects the Haar box's slight bias; X is mirror-aware so positive
+		// always moves the anchor right in the displayed image.
+		const float offX = parameters.eyeCenterOffsetX.get() * (config.mirrorX ? -1.0f : 1.0f);
+		const float offY = parameters.eyeCenterOffsetY.get();
+		const float rawBoxCx = raw.eyeBox.x + raw.eyeBox.width * 0.5f + offX;
+		const float rawBoxCy = raw.eyeBox.y + raw.eyeBox.height * 0.5f + offY;
 
 		if (presentSmoothed && !presentSmoothedPrev) {
 			filterEyeX.reset(rawBoxCx);
@@ -1310,6 +1354,7 @@ void EyeCameraStream::drawDetectionOverlay(float dispX, float dispY,
 	const float fitShown = snapResult.fitQuality > 0.0f ? snapResult.fitQuality : snapLastRaw.fitQuality;
 	std::string info = std::string("det=") + detName
 		+ "  fit=" + ofToString(fitShown, 2)
+		+ "  dark=" + ofToString(snapLastRaw.darkness, 2)
 		+ "  cand=" + ofToString((unsigned)snapLastRaw.candidateBoxes.size())
 		+ "b/" + ofToString((unsigned)snapLastRaw.candidateIris.size()) + "i"
 		+ "  runs=" + ofToString((unsigned long long)runs)

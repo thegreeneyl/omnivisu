@@ -92,6 +92,9 @@ private:
 		float angleDeg = 0.0f;
 		float radius = 0.0f;       ///< Mean radius = (size.x + size.y) / 4.
 		float fitQuality = 0.0f;   ///< 0..1.
+		float darkness = 0.0f;     ///< 0..1: how much darker the interior is than
+		                           ///< the surrounding ring (specular-highlight
+		                           ///< pixels excluded). Higher = more iris-like.
 		ofRectangle box;
 	};
 
@@ -107,6 +110,7 @@ private:
 		float irisAngleDeg = 0.0f;
 		float irisRadiusPx = 0.0f;
 		float fitQuality = 0.0f;
+		float darkness = 0.0f; ///< Chosen iris darkness margin, 0..1 (see IrisCandidate).
 
 		// All candidates considered this frame, in *source* px, for the debug
 		// overlay ("show candidates"). Boxes are Haar eye boxes (modes 1/2);
@@ -142,7 +146,17 @@ private:
 		// Roundness gate: minor/major axis ratio a candidate must reach (1 = a
 		// perfect circle). Higher rejects elongated ellipses.
 		ofParameter<float> irisMinCircularity{"iris min circularity", 0.7f, 0.0f, 1.0f};
+		// Darkness gate: how much darker the ellipse interior must be than the
+		// surrounding ring (0..1, normalized so 1.0 == ~128 gray levels). Rejects
+		// bright features / specular reflections that pass the shape gates.
+		ofParameter<float> irisMinDarkness{"iris min darkness", 0.05f, 0.0f, 1.0f};
 		ofParameter<int> irisPreferredSide{"iris preferred side", 0, 0, 2};
+		// Manual correction for the eye-box anchor, in *source* pixels. Haar eye
+		// boxes sit slightly off; tune per eye. Positive X moves the center right
+		// in the (mirror-aware) displayed image, positive Y moves it down. Shifts
+		// the eye box/follow anchor; the iris is unaffected.
+		ofParameter<float> eyeCenterOffsetX{"eye center offset x", 0.0f, -200.0f, 200.0f};
+		ofParameter<float> eyeCenterOffsetY{"eye center offset y", 0.0f, -200.0f, 200.0f};
 		// Debug: draw every candidate eye box and iris ellipse (not just the
 		// chosen one) on the raw camera overlay.
 		ofParameter<bool> debugShowCandidates{"debug show candidates", false};
