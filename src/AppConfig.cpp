@@ -39,6 +39,20 @@ bool AppConfig::load(const std::string & path) {
 		streaming.asyncReadback = s.value("async_readback", streaming.asyncReadback);
 	}
 
+	if (json.contains("playback")) {
+		const auto & p = json["playback"];
+		playback.enabled = p.value("enabled", playback.enabled);
+		playback.folder = p.value("folder", playback.folder);
+		playback.loop = p.value("loop", playback.loop);
+		playback.fps = p.value("fps", playback.fps);
+	}
+
+	if (json.contains("recording")) {
+		const auto & r = json["recording"];
+		recording.folder = r.value("folder", recording.folder);
+		recording.format = r.value("format", recording.format);
+	}
+
 	if (json.contains("mask")) {
 		maskJson = json["mask"];
 	}
@@ -50,6 +64,7 @@ bool AppConfig::load(const std::string & path) {
 	loaded = true;
 	ofLogNotice("AppConfig") << "loaded " << path << " (display_mode=" << displayMode
 		<< ", streaming=" << (streaming.enabled ? "on" : "off")
-		<< " -> " << streaming.targetIp << ":" << streaming.targetPort << ")";
+		<< " -> " << streaming.targetIp << ":" << streaming.targetPort
+		<< ", playback=" << (playback.enabled ? "on" : "off") << ")";
 	return true;
 }

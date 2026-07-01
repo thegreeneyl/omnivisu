@@ -146,5 +146,25 @@
 # PROJECT_CFLAGS += -I$(IDS_PEAK_ROOT)/include
 # PROJECT_LDFLAGS += -Wl,-rpath,$(IDS_PEAK_ROOT)/lib -L$(IDS_PEAK_ROOT)/lib -lids_peak -lids_peak_ipl
 
+################################################################################
+# CAMERA-LESS BUILD (macOS / any machine without the IDS peak SDK)
+#
+# The ofxIdsPeak addon pulls in the Linux-only IDS peak SDK headers
+# (<peak/peak.hpp>), so it cannot compile on macOS. To build/run there for
+# development, drive the app entirely from recorded image sequences instead of
+# the live camera:
+#
+#   1. In this project's addons.make, remove the "ofxIdsPeak" line (leave
+#      ofxGui, ofxOpenCv, ofxNetwork) so the SDK is never compiled/linked.
+#   2. Uncomment the define below. It compiles out every grabber reference and
+#      forces disk playback on (see EyeCameraStream / OMNIVISU_NO_CAMERA).
+#   3. Regenerate/build with a macOS openFrameworks install (this folder is the
+#      linux64 release; the Linux build is unaffected by the steps above).
+#
+# With OMNIVISU_NO_CAMERA defined the "playback" block in config.json is
+# implied; put recorded sessions under bin/data/recordings/<timestamp>/eye_*/.
+#
+# PROJECT_DEFINES += OMNIVISU_NO_CAMERA
+
 # vscode template
 

@@ -4,6 +4,8 @@ obj/
 bin/*
 !bin/data/
 # Inside bin/data, ignore any generated subfolders if needed (add patterns here)
+# Dev-only raw camera recordings (image sequences); never commit captures.
+bin/data/recordings/
 
 # Common shared libs that get copied into bin/ on Linux at build time
 # (these come from the openFrameworks distribution, not from this repo)

@@ -37,6 +37,8 @@ private:
 	void updateStream();
 	void applyStreamingConfig(const AppConfig::StreamingConfig & sc);
 	void reloadConfig();
+	void toggleRecording();
+	void advancePlaybackLockstep();
 
 	std::vector<std::unique_ptr<EyeCameraStream>> streams;
 	std::vector<std::unique_ptr<ofxPanel>> guis;
@@ -51,6 +53,12 @@ private:
 	bool mouthLoaded = false;
 	bool showGui = false;
 	bool showFps = false;
+	// Dev-only: raw camera recording toggle (spacebar). See toggleRecording().
+	bool recording = false;
+	// Dev-only: disk-playback frame-rate cap (0 = uncapped) and its fixed-grid
+	// schedule. See advancePlaybackLockstep().
+	float playbackFps = 0.0f;
+	float nextPlaybackFrameTime = 0.0f;
 	float lastFpsLogTime = 0.0f;
 
 	// Eye video streaming. The combined stream FBO holds the two eyes

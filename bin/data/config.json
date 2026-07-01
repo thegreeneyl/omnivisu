@@ -2,6 +2,16 @@
     "general": {
         "display_mode": "mask"
     },
+    "playback": {
+        "enabled": true,
+        "folder": "recordings",
+        "loop": true,
+        "fps": 30
+    },
+    "recording": {
+        "folder": "recordings",
+        "format": "jpg"
+    },
     "streaming": {
         "enabled": true,
         "target_ip": "192.168.178.103",

@@ -64,12 +64,20 @@ void ofApp::setup() {
 		{"left", "eye_left.json"},
 		{"right", "eye_right.json"},
 	}};
+	const AppConfig::PlaybackConfig & pb = appConfig.getPlayback();
+	const AppConfig::RecordingConfig & rec = appConfig.getRecording();
+	playbackFps = pb.fps;
 	for (const auto & eye : eyes) {
 		EyeCameraStream::Config cfg;
 		cfg.name = eye.name;
 		cfg.paramsFile = eye.paramsFile;
 		cfg.fboSize = {672, 504};
 		cfg.mirrorX = true;
+		cfg.playbackEnabled = pb.enabled;
+		cfg.playbackFolder = pb.folder;
+		cfg.playbackLoop = pb.loop;
+		cfg.recordingFolder = rec.folder;
+		cfg.recordingFormat = rec.format;
 
 		auto stream = std::make_unique<EyeCameraStream>();
 		if (!stream->setup(cfg)) {
@@ -82,7 +90,9 @@ void ofApp::setup() {
 	for (size_t i = 0; i < streams.size(); ++i) {
 		auto panel = std::make_unique<ofxPanel>();
 		panel->setup(streams[i]->getName());
+#if !defined(OMNIVISU_NO_CAMERA)
 		panel->add(streams[i]->getGrabberParameters());
+#endif
 		panel->add(streams[i]->getTrackingParameters());
 		panel->add(streams[i]->getGradingParameters());
 		panel->add(streams[i]->getViewParameters());
@@ -167,6 +177,10 @@ void ofApp::reloadConfig() {
 
 	mouthLoaded = mouth.load(appConfig.getMouthJson());
 
+	// Pick up a changed playback fps cap on reload (enable/folder still need a
+	// restart since the grabber/prefetcher are wired at setup).
+	playbackFps = appConfig.getPlayback().fps;
+
 	// Re-apply streaming: this tears down and restarts the sender so changes to
 	// target ip/port, compression, payload size, fps cap, async readback, or the
 	// enabled flag all take effect immediately.
@@ -203,7 +217,58 @@ void ofApp::layoutGuis() {
 }
 
 //--------------------------------------------------------------
+void ofApp::advancePlaybackLockstep() {
+	// Guard: do nothing unless every eye is in disk-playback mode. In live
+	// capture this returns immediately, so none of the record/playback machinery
+	// touches the original per-stream update logic.
+	if (streams.empty()) {
+		return;
+	}
+	for (const auto & stream : streams) {
+		if (!stream->isPlayback()) {
+			return;
+		}
+	}
+
+	// Optional frame-rate cap (playback.fps; 0 = uncapped). Only the *attempt*
+	// is time-gated here; the schedule is advanced solely on a successful commit
+	// below, so the effective rate is min(target fps, decode throughput) and a
+	// slow decoder never makes us silently skip ahead.
+	if (playbackFps > 0.0f && ofGetElapsedTimef() < nextPlaybackFrameTime) {
+		return;
+	}
+
+	// Lockstep advance: stage every eye's next decoded frame, then commit them
+	// together only when *all* are ready, so per-eye decode-rate differences
+	// can't desync the frame indices.
+	bool allStaged = true;
+	for (const auto & stream : streams) {
+		// Call stage on every stream (side effects), never short-circuit.
+		allStaged = stream->stagePlaybackFrame() && allStaged;
+	}
+	if (allStaged) {
+		for (const auto & stream : streams) {
+			stream->commitPlaybackFrame();
+		}
+
+		if (playbackFps > 0.0f) {
+			const float now = ofGetElapsedTimef();
+			const float interval = 1.0f / playbackFps;
+			nextPlaybackFrameTime += interval;
+			// Resync after a stall instead of bursting a catch-up sequence.
+			if (nextPlaybackFrameTime < now) {
+				nextPlaybackFrameTime = now + interval;
+			}
+		}
+	}
+}
+
+//--------------------------------------------------------------
 void ofApp::update() {
+	// Disk-playback only; a no-op (early return) for live capture, so the
+	// original camera update path below is left exactly as it was.
+	advancePlaybackLockstep();
+
 	for (const auto & stream : streams) {
 		stream->update();
 	}
@@ -222,11 +287,16 @@ void ofApp::update() {
 		std::ostringstream msg;
 		msg << "app fps: " << ofGetFrameRate();
 		for (size_t i = 0; i < streams.size(); ++i) {
-			const auto & g = streams[i]->getGrabber();
 			const auto r = streams[i]->getResult();
-			msg << " | [" << i << "] frames=" << g.getFrameCounter()
-				<< " err=" << g.getErrorCounter()
-				<< " worker_runs=" << streams[i]->getDetectionCount()
+			msg << " | [" << i << "]";
+#if !defined(OMNIVISU_NO_CAMERA)
+			const auto & g = streams[i]->getGrabber();
+			msg << " frames=" << g.getFrameCounter()
+				<< " err=" << g.getErrorCounter();
+#else
+			msg << " playback";
+#endif
+			msg << " worker_runs=" << streams[i]->getDetectionCount()
 				<< " hits=" << streams[i]->getValidDetectionCount()
 				<< " present=" << (r.present ? 1 : 0)
 				<< " conf=" << ofToString(r.confidence, 2)
@@ -297,6 +367,16 @@ void ofApp::draw() {
 	if (showFps) {
 		ofSetColor(255);
 		ofDrawBitmapString(ofToString(ofGetFrameRate(), 2), 20, ofGetHeight() - 20);
+	}
+
+	if (recording) {
+		ofPushStyle();
+		ofFill();
+		ofSetColor(230, 30, 30);
+		ofDrawCircle(34.0f, 34.0f, 12.0f);
+		ofSetColor(255);
+		ofDrawBitmapString("REC", 52.0f, 39.0f);
+		ofPopStyle();
 	}
 
 	updateStream();
@@ -427,7 +507,40 @@ void ofApp::keyPressed(int key) {
 			stream->loadParameters();
 		}
 		reloadConfig();
+	} else if (key == ' ') {
+		toggleRecording();
 	}
+}
+
+//--------------------------------------------------------------
+void ofApp::toggleRecording() {
+#if defined(OMNIVISU_NO_CAMERA)
+	ofLogNotice("omnivisu") << "recording not available in a playback-only (no-camera) build";
+#else
+	if (recording) {
+		for (const auto & stream : streams) {
+			stream->stopRecording();
+		}
+		recording = false;
+		ofLogNotice("omnivisu") << "recording stopped";
+		return;
+	}
+
+	if (!streams.empty() && streams[0]->isPlayback()) {
+		ofLogNotice("omnivisu") << "recording disabled during playback";
+		return;
+	}
+
+	// One timestamped session folder shared by both eyes; each eye gets its own
+	// subfolder so the sequences stay paired for playback.
+	const std::string timestamp = ofGetTimestampString("%y%m%d-%H%M%S");
+	const std::string session = ofFilePath::join(appConfig.getRecording().folder, timestamp);
+	for (const auto & stream : streams) {
+		stream->startRecording(ofFilePath::join(session, "eye_" + stream->getName()));
+	}
+	recording = true;
+	ofLogNotice("omnivisu") << "recording to " << session;
+#endif
 }
 
 //--------------------------------------------------------------

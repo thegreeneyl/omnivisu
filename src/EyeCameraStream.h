@@ -3,14 +3,21 @@
 #include "ofMain.h"
 #include "ofxGui.h"
 #include "ofxOpenCv.h"
+#if !defined(OMNIVISU_NO_CAMERA)
 #include "ofxIdsPeak.h"
+#endif
 #include "OneEuroFilter.h"
 
 #include <opencv2/imgproc.hpp>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <vector>
 
 /// One camera stream: capture (main thread), eye detection (worker thread),
 /// full-frame letterboxed render to FBO (main thread).
@@ -33,6 +40,16 @@ public:
 		std::string cascadeFile = "haarcascade_eye.xml";
 		std::string paramsFile;
 		bool mirrorX = true;
+
+		// Dev-only frame source / recording. When playbackEnabled is set (or the
+		// build defines OMNIVISU_NO_CAMERA) the grabber is never opened and
+		// frames are read from disk instead. recordingFolder/Format are only used
+		// while recording the live camera.
+		bool playbackEnabled = false;
+		std::string playbackFolder = "recordings";
+		bool playbackLoop = true;
+		std::string recordingFolder = "recordings";
+		std::string recordingFormat = "jpg";
 	};
 
 	struct Result {
@@ -77,9 +94,11 @@ public:
 	/// there is no current detection or no fitted iris.
 	float getGazeX() const;
 
+#if !defined(OMNIVISU_NO_CAMERA)
 	const ofxIdsPeak::Grabber & getGrabber() const { return grabber; }
-	ofParameterGroup & getParameters() { return parameters.group; }
 	ofParameterGroup & getGrabberParameters() { return grabber.parameters.group; }
+#endif
+	ofParameterGroup & getParameters() { return parameters.group; }
 	ofParameterGroup & getTrackingParameters() { return parameters.trackingGroup; }
 	ofParameterGroup & getGradingParameters() { return parameters.gradingGroup; }
 	ofParameterGroup & getViewParameters() { return parameters.viewGroup; }
@@ -88,6 +107,25 @@ public:
 
 	bool saveParameters() const;
 	bool loadParameters();
+
+	/// True when this stream is fed by on-disk recordings (grabber not opened).
+	bool isPlayback() const { return playback; }
+
+	/// Two-phase, app-coordinated playback advance that keeps every eye locked
+	/// to the same frame index. stagePlaybackFrame() pulls the next decoded
+	/// frame into a holding slot and returns true once one is ready;
+	/// commitPlaybackFrame() swaps it in and uploads the texture. The app only
+	/// commits after *every* eye has a frame staged, so per-eye decode-rate
+	/// differences can no longer desync them.
+	bool stagePlaybackFrame();
+	void commitPlaybackFrame();
+
+	/// Dev-only recording of the raw camera frames to an image sequence in `dir`
+	/// (relative to bin/data). No-op in playback mode. Writing happens on a
+	/// background thread so capture is never stalled.
+	void startRecording(const std::string & dir);
+	void stopRecording();
+	bool isRecording() const { return recorder != nullptr; }
 
 	std::uint64_t getDetectionCount() const { return detectionsRun.load(); }
 	std::uint64_t getValidDetectionCount() const { return detectionsValid.load(); }
@@ -223,7 +261,131 @@ private:
 		float captureTime = 0.0f;
 	};
 
+	/// Dev-only background frame saver. Owns its own thread and channel so a
+	/// fresh instance is created per recording session (an ofThreadChannel
+	/// cannot be reopened once closed). Writes zero-padded image sequences.
+	class FrameRecorder : public ofThread {
+	public:
+		~FrameRecorder() override { stop(); }
+		void start(const std::string & dir, const std::string & format) {
+			outDir = dir;
+			fmt = format.empty() ? "jpg" : format;
+			startThread();
+		}
+		void stop() {
+			channel.close();
+			if (isThreadRunning()) {
+				waitForThread(false);
+			}
+		}
+		void enqueue(const ofPixels & px) { channel.send(px); }
+
+	protected:
+		void threadedFunction() override {
+			ofPixels px;
+			std::size_t idx = 0;
+			while (channel.receive(px)) {
+				char name[48];
+				std::snprintf(name, sizeof(name), "/frame_%06zu.", idx++);
+				ofSaveImage(px, outDir + name + fmt, OF_IMAGE_QUALITY_BEST);
+			}
+		}
+
+	private:
+		ofThreadChannel<ofPixels> channel;
+		std::string outDir;
+		std::string fmt = "jpg";
+	};
+
+	/// Dev-only background frame decoder for playback. JPEG/PNG decode is the
+	/// playback bottleneck, so it is pulled off the render thread: this thread
+	/// reads ahead through the ordered frame list and decodes into a bounded
+	/// pool of reusable ofPixels buffers. The main thread pops the next decoded
+	/// frame (non-blocking), uploads it to a texture, and returns the buffer.
+	/// The `empty` pool caps how many frames may be in flight, so a fast disk
+	/// cannot run the decoder ahead without bound.
+	class FramePrefetcher : public ofThread {
+	public:
+		~FramePrefetcher() override { stop(); }
+
+		void start(std::vector<std::string> files, bool loop, int depth, const std::string & tag) {
+			playlist = std::move(files);
+			loopPlayback = loop;
+			name = tag;
+			cursor = 0;
+			for (int i = 0; i < std::max(1, depth); ++i) {
+				empty.send(ofPixels());
+			}
+			startThread();
+		}
+		void stop() {
+			empty.close();
+			filled.close();
+			if (isThreadRunning()) {
+				waitForThread(false);
+			}
+		}
+		/// Non-blocking: moves the next decoded frame into `out` if one is ready.
+		bool tryGet(ofPixels & out) { return filled.tryReceive(out); }
+		/// Returns a consumed buffer to the pool for reuse.
+		void recycle(ofPixels && buf) { empty.send(std::move(buf)); }
+
+	protected:
+		void threadedFunction() override {
+			ofPixels buf;
+			bool haveBuf = false;
+			while (true) {
+				if (!haveBuf) {
+					if (!empty.receive(buf)) {
+						break; // pool closed by stop().
+					}
+					haveBuf = true;
+				}
+				if (playlist.empty()) {
+					break;
+				}
+				if (cursor >= playlist.size()) {
+					if (!loopPlayback) {
+						break; // exhausted; main thread holds the last frame.
+					}
+					cursor = 0;
+				}
+				const std::string path = playlist[cursor++];
+				if (ofLoadImage(buf, path)) {
+					// Match the live camera's RGB output for an identical pipeline.
+					if (buf.getNumChannels() != 3) {
+						buf.setNumChannels(3);
+					}
+					if (!filled.send(std::move(buf))) {
+						break; // queue closed by stop().
+					}
+					haveBuf = false; // buf was moved out; fetch a fresh one.
+				} else {
+					ofLogWarning("EyeCameraStream") << name
+						<< ": failed to load playback frame " << path;
+					// keep the buffer and try the next frame.
+				}
+			}
+		}
+
+	private:
+		ofThreadChannel<ofPixels> empty;  // reusable buffer pool (bounds prefetch depth).
+		ofThreadChannel<ofPixels> filled; // decoded frames ready for the main thread.
+		std::vector<std::string> playlist;
+		std::size_t cursor = 0;
+		bool loopPlayback = true;
+		std::string name;
+	};
+
 	void setupParameters();
+	/// Current frame source, transparently either the live grabber or the
+	/// on-disk playback buffers. Everything downstream reads through these.
+	const ofPixels & sourcePixels() const;
+	const ofTexture & sourceTexture() const;
+	bool sourceFrameNew() const;
+	/// Scans the playback folder once at setup, building this eye's ordered,
+	/// flat list of frame files across every recorded session subfolder.
+	void buildPlaybackList();
 	bool detectEye(const ofPixels & pixels, RawDetection & out);
 	/// Haar cascade detection on the prepared `cvGray` image. Fills `out` and
 	/// returns true on a valid hit. (Legacy path, kept for A/B comparison.)
@@ -269,7 +431,9 @@ private:
 	Parameters parameters;
 	Result result;
 
+#if !defined(OMNIVISU_NO_CAMERA)
 	ofxIdsPeak::Grabber grabber;
+#endif
 	ofFbo targetFbo;
 	ofShader gradeShader;
 	bool gradeShaderLoaded = false;
@@ -323,6 +487,24 @@ private:
 
 	std::atomic<std::uint64_t> detectionsRun{0};
 	std::atomic<std::uint64_t> detectionsValid{0};
+
+	// Dev-only disk playback source. When `playback` is set the grabber is never
+	// opened; the prefetcher decodes `playbackFiles` (all sessions concatenated)
+	// on a background thread and commitPlaybackFrame() uploads the next ready
+	// frame into playbackPixels + playbackTexture.
+	bool playback = false;
+	std::vector<std::string> playbackFiles;
+	bool playbackFrameNew = false;
+	ofPixels playbackPixels;
+	ofTexture playbackTexture;
+	// Holding slot for a decoded-but-not-yet-shown frame, so the app can wait
+	// until both eyes have one ready before committing them together.
+	ofPixels pendingPixels;
+	bool hasPending = false;
+	std::unique_ptr<FramePrefetcher> prefetcher;
+
+	// Dev-only recorder; non-null only while recording. Recreated per session.
+	std::unique_ptr<FrameRecorder> recorder;
 
 	// Dimensions (px) of the cropped frame handed to the most recent detection
 	// job, so the worker normalizes distances against the cropped frame rather

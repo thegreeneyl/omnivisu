@@ -7,16 +7,22 @@
 namespace {
 constexpr float kPi = 3.14159265358979323846f;
 
+// Playback frames decoded ahead of the render thread, per eye. Bounds the
+// prefetcher's memory to ~(depth + 1) full-frame RGB buffers per eye.
+constexpr int kPlaybackPrefetchDepth = 4;
+
 float clamp01(float v) {
 	return std::max(0.0f, std::min(1.0f, v));
 }
 
+#if !defined(OMNIVISU_NO_CAMERA)
 ofxIdsPeak::DeviceSelect deviceSelectFromString(const std::string & s) {
 	if (s == "serial") return ofxIdsPeak::DeviceSelect::Serial;
 	if (s == "model") return ofxIdsPeak::DeviceSelect::Model;
 	if (s == "index") return ofxIdsPeak::DeviceSelect::Index;
 	return ofxIdsPeak::DeviceSelect::Any;
 }
+#endif
 
 float rectDistanceSq(const ofRectangle & a, const ofRectangle & b) {
 	const float ax = a.x + a.width * 0.5f;
@@ -32,7 +38,9 @@ float rectDistanceSq(const ofRectangle & a, const ofRectangle & b) {
 //--------------------------------------------------------------
 void EyeCameraStream::setupParameters() {
 	parameters.group.setName(config.name);
+#if !defined(OMNIVISU_NO_CAMERA)
 	parameters.group.add(grabber.parameters.group);
+#endif
 
 	parameters.trackingGroup.clear();
 	parameters.trackingGroup.setName("tracking");
@@ -104,35 +112,54 @@ void EyeCameraStream::setupParameters() {
 //--------------------------------------------------------------
 bool EyeCameraStream::setup(const Config & cfg) {
 	config = cfg;
+
+	// In a camera-less build (macOS) playback is the only possible source;
+	// otherwise honor the config flag. When playing back, the grabber is never
+	// touched so the IDS SDK / hardware is not required at all.
+#if defined(OMNIVISU_NO_CAMERA)
+	playback = true;
+#else
+	playback = config.playbackEnabled;
+#endif
+
 	setupParameters();
 
-	// Camera publishes RGB color frames so the rendered FBO stays RGB; the
-	// detection worker desaturates internally via ofxCvGrayscaleImage.
-	grabber.applyLowLatencyPreset(ofxIdsPeak::OutputFormat::RGB);
+	bool grabberOk = true;
+#if !defined(OMNIVISU_NO_CAMERA)
+	if (!playback) {
+		// Camera publishes RGB color frames so the rendered FBO stays RGB; the
+		// detection worker desaturates internally via ofxCvGrayscaleImage.
+		grabber.applyLowLatencyPreset(ofxIdsPeak::OutputFormat::RGB);
+	}
+#endif
 
 	// Load tunable params from JSON before the grabber initializes so the
 	// camera comes up with the persisted exposure/gain/WB/etc. values.
 	loadParameters();
 
-	// Translate the JSON "camera" block into the grabber's device selector so
-	// this eye binds to a specific physical camera (by serial/model/index).
-	const ofxIdsPeak::DeviceSelect selectMode = deviceSelectFromString(parameters.selectBy.get());
-	const std::string selectValue = parameters.selectValue.get();
-	int selectIndex = 0;
-	if (selectMode == ofxIdsPeak::DeviceSelect::Index) {
-		try {
-			selectIndex = std::stoi(selectValue);
-		} catch (const std::exception &) {
-			ofLogWarning("EyeCameraStream") << config.name
-				<< ": camera select index '" << selectValue << "' is not an integer; using 0";
+#if !defined(OMNIVISU_NO_CAMERA)
+	if (!playback) {
+		// Translate the JSON "camera" block into the grabber's device selector so
+		// this eye binds to a specific physical camera (by serial/model/index).
+		const ofxIdsPeak::DeviceSelect selectMode = deviceSelectFromString(parameters.selectBy.get());
+		const std::string selectValue = parameters.selectValue.get();
+		int selectIndex = 0;
+		if (selectMode == ofxIdsPeak::DeviceSelect::Index) {
+			try {
+				selectIndex = std::stoi(selectValue);
+			} catch (const std::exception &) {
+				ofLogWarning("EyeCameraStream") << config.name
+					<< ": camera select index '" << selectValue << "' is not an integer; using 0";
+			}
+		}
+		grabber.setDeviceSelector(selectMode, selectValue, selectIndex);
+
+		grabberOk = grabber.setup();
+		if (!grabberOk) {
+			ofLogError("EyeCameraStream") << config.name << ": failed to initialize IDS peak camera";
 		}
 	}
-	grabber.setDeviceSelector(selectMode, selectValue, selectIndex);
-
-	const bool grabberOk = grabber.setup();
-	if (!grabberOk) {
-		ofLogError("EyeCameraStream") << config.name << ": failed to initialize IDS peak camera";
-	}
+#endif
 
 	const of::filesystem::path cascadePath = ofToDataPath(config.cascadeFile, true);
 	if (!ofFile::doesFileExist(cascadePath)) {
@@ -172,6 +199,15 @@ bool EyeCameraStream::setup(const Config & cfg) {
 	filterBoxH.setup(minCutoff, beta);
 	filterIrisX.setup(minCutoff, beta);
 	filterIrisY.setup(minCutoff, beta);
+
+	if (playback) {
+		buildPlaybackList();
+		if (!playbackFiles.empty()) {
+			prefetcher = std::make_unique<FramePrefetcher>();
+			prefetcher->start(playbackFiles, config.playbackLoop,
+				kPlaybackPrefetchDepth, config.name);
+		}
+	}
 
 	workerLastFrameTime = ofGetElapsedTimef();
 	lastFollowTime = workerLastFrameTime;
@@ -307,14 +343,18 @@ bool EyeCameraStream::loadParameters() {
 	// applyParameters() plus a reconfigureOutputFormat() buffer realloc) and
 	// crash. Bracket the write so the camera parameters are applied once, safely.
 	// During initial setup the grabber is not yet initialized, so this is a no-op.
+#if !defined(OMNIVISU_NO_CAMERA)
 	const bool live = grabber.isInitialized();
 	if (live) {
 		grabber.beginParameterBatch();
 	}
+#endif
 	ofDeserialize(json, parameters.group);
+#if !defined(OMNIVISU_NO_CAMERA)
 	if (live) {
 		grabber.endParameterBatch();
 	}
+#endif
 	ofLogNotice("EyeCameraStream") << config.name << ": params loaded from " << path;
 	return true;
 }
@@ -334,6 +374,8 @@ bool EyeCameraStream::saveParameters() const {
 
 //--------------------------------------------------------------
 EyeCameraStream::~EyeCameraStream() {
+	stopRecording();
+	prefetcher.reset();
 	frameJobs.close();
 	if (isThreadRunning()) {
 		stopThread();
@@ -357,9 +399,9 @@ ofxCvBlob EyeCameraStream::pickBestEyeBlob(const std::vector<ofxCvBlob> & blobs)
 	// Normalize against the cropped detection frame (what the worker actually
 	// sees), falling back to the full sensor before the first cropped dispatch.
 	const float frameW = activeCropW.load() > 0 ? static_cast<float>(activeCropW.load())
-		: static_cast<float>(grabber.getPixels().getWidth());
+		: static_cast<float>(sourcePixels().getWidth());
 	const float frameH = activeCropH.load() > 0 ? static_cast<float>(activeCropH.load())
-		: static_cast<float>(grabber.getPixels().getHeight());
+		: static_cast<float>(sourcePixels().getHeight());
 	const ofRectangle frame(0, 0, frameW, frameH);
 	const float frameDiagSq = frame.width * frame.width + frame.height * frame.height;
 
@@ -833,9 +875,9 @@ EyeCameraStream::IrisCandidate EyeCameraStream::pickBestIris(
 
 	// Normalize against the cropped detection frame (see pickBestEyeBlob).
 	const float frameW = activeCropW.load() > 0 ? static_cast<float>(activeCropW.load())
-		: static_cast<float>(grabber.getPixels().getWidth());
+		: static_cast<float>(sourcePixels().getWidth());
 	const float frameH = activeCropH.load() > 0 ? static_cast<float>(activeCropH.load())
-		: static_cast<float>(grabber.getPixels().getHeight());
+		: static_cast<float>(sourcePixels().getHeight());
 	const ofRectangle frame(0, 0, frameW, frameH);
 	const float frameDiagSq = frame.width * frame.width + frame.height * frame.height;
 	const float expected = std::max(1.0f, static_cast<float>(parameters.irisExpectedRadius.get()));
@@ -984,7 +1026,7 @@ void EyeCameraStream::applySmoothing(const RawDetection & raw, float dt) {
 
 //--------------------------------------------------------------
 void EyeCameraStream::renderTargetFbo() {
-	if (!grabber.getTexture().isAllocated()) {
+	if (!sourceTexture().isAllocated()) {
 		return;
 	}
 
@@ -994,7 +1036,7 @@ void EyeCameraStream::renderTargetFbo() {
 	// Crop sub-rectangle of the full sensor frame; all fit/follow math below
 	// works in cropped-source space so the FBO shows only the cropped image.
 	const ofRectangle cropRect = computeCropRectSource(
-		grabber.getTexture().getWidth(), grabber.getTexture().getHeight());
+		sourceTexture().getWidth(), sourceTexture().getHeight());
 	const float srcW = cropRect.width;
 	const float srcH = cropRect.height;
 	float drawW = fboW;
@@ -1100,7 +1142,7 @@ void EyeCameraStream::renderTargetFbo() {
 //--------------------------------------------------------------
 void EyeCameraStream::drawCameraIntoFbo(float drawX, float drawY, float drawW, float drawH,
 		const ofRectangle & srcRect) {
-	const ofTexture & tex = grabber.getTexture();
+	const ofTexture & tex = sourceTexture();
 
 	// Lazy-build shader once the texture target is known. Rebuild if the target
 	// flips between rect / 2D (driver/GL setting changes).
@@ -1186,12 +1228,26 @@ void EyeCameraStream::threadedFunction() {
 
 //--------------------------------------------------------------
 void EyeCameraStream::update() {
-	grabber.update();
+#if !defined(OMNIVISU_NO_CAMERA)
+	// In playback the next frame is staged/committed by the app (lockstep across
+	// eyes) *before* update() runs; live capture polls the grabber here.
+	if (!playback) {
+		grabber.update();
+	}
+#endif
 
-	if (!grabber.isFrameNew()) {
+	if (!sourceFrameNew()) {
 		renderTargetFbo();
 		return;
 	}
+
+	// Dev-only: capture the raw (uncropped, ungraded) frame before anything
+	// downstream touches it, so playback reproduces the live pipeline exactly.
+#if !defined(OMNIVISU_NO_CAMERA)
+	if (!playback && recorder) {
+		recorder->enqueue(grabber.getPixels());
+	}
+#endif
 
 	if (!parameters.enableEyeTracking) {
 		std::lock_guard<std::mutex> lk(stateMutex);
@@ -1213,7 +1269,7 @@ void EyeCameraStream::update() {
 	// Crop the raw frame *before* detection so the worker never sees the
 	// inter-camera overlap (the opposite eye), and so detection coordinates
 	// already live in the same cropped space the FBO/overlay display.
-	const ofPixels & full = grabber.getPixels();
+	const ofPixels & full = sourcePixels();
 	const ofRectangle cr = computeCropRectSource(full.getWidth(), full.getHeight());
 	if (cr.x <= 0.0f && cr.y <= 0.0f
 		&& cr.width >= full.getWidth() && cr.height >= full.getHeight()) {
@@ -1228,6 +1284,173 @@ void EyeCameraStream::update() {
 	frameJobs.send(std::move(job));
 
 	renderTargetFbo();
+}
+
+//--------------------------------------------------------------
+const ofPixels & EyeCameraStream::sourcePixels() const {
+#if defined(OMNIVISU_NO_CAMERA)
+	return playbackPixels;
+#else
+	return playback ? playbackPixels : grabber.getPixels();
+#endif
+}
+
+//--------------------------------------------------------------
+const ofTexture & EyeCameraStream::sourceTexture() const {
+#if defined(OMNIVISU_NO_CAMERA)
+	return playbackTexture;
+#else
+	return playback ? playbackTexture : grabber.getTexture();
+#endif
+}
+
+//--------------------------------------------------------------
+bool EyeCameraStream::sourceFrameNew() const {
+#if defined(OMNIVISU_NO_CAMERA)
+	return playbackFrameNew;
+#else
+	return playback ? playbackFrameNew : grabber.isFrameNew();
+#endif
+}
+
+//--------------------------------------------------------------
+void EyeCameraStream::buildPlaybackList() {
+	playbackFiles.clear();
+
+	const std::string root = ofToDataPath(config.playbackFolder, true);
+	ofDirectory rootDir(root);
+	if (!rootDir.exists()) {
+		ofLogWarning("EyeCameraStream") << config.name
+			<< ": playback folder not found: " << root;
+		return;
+	}
+
+	// Sessions are the timestamped subfolders; sorted lexically == chronological
+	// with the YYMMDD-HHMMSS naming.
+	rootDir.listDir();
+	std::vector<std::string> sessions;
+	for (std::size_t i = 0; i < rootDir.size(); ++i) {
+		if (rootDir.getFile(i).isDirectory()) {
+			sessions.push_back(rootDir.getPath(i));
+		}
+	}
+	std::sort(sessions.begin(), sessions.end());
+
+	// Sorted list of image files inside one eye subfolder.
+	auto listEyeFrames = [](const std::string & dir) {
+		std::vector<std::string> files;
+		ofDirectory d(dir);
+		if (!d.exists()) {
+			return files;
+		}
+		d.allowExt("jpg");
+		d.allowExt("jpeg");
+		d.allowExt("png");
+		d.listDir();
+		d.sort();
+		for (std::size_t i = 0; i < d.size(); ++i) {
+			files.push_back(d.getPath(i));
+		}
+		return files;
+	};
+
+	// Within each session, concatenate this eye's ordered frame files. The two
+	// cameras are unsynchronized and record slightly different frame counts, so
+	// clamp each session to the shortest eye_* sequence in it. That keeps frame
+	// index N of the left eye paired with index N of the right eye during
+	// playback. Recordings on disk are left untouched; the surplus tail frames
+	// of the longer eye are simply not queued.
+	const std::string eyeSub = "eye_" + config.name;
+	for (const auto & session : sessions) {
+		const std::vector<std::string> mine = listEyeFrames(ofFilePath::join(session, eyeSub));
+		if (mine.empty()) {
+			continue;
+		}
+
+		std::size_t frameCount = mine.size();
+		ofDirectory sessionDir(session);
+		sessionDir.listDir();
+		for (std::size_t i = 0; i < sessionDir.size(); ++i) {
+			if (!sessionDir.getFile(i).isDirectory()) {
+				continue;
+			}
+			const std::string name = sessionDir.getName(i);
+			if (name == eyeSub || name.rfind("eye_", 0) != 0) {
+				continue; // only other eye_* siblings.
+			}
+			const std::size_t siblingCount = listEyeFrames(sessionDir.getPath(i)).size();
+			if (siblingCount > 0) {
+				frameCount = std::min(frameCount, siblingCount);
+			}
+		}
+
+		for (std::size_t i = 0; i < frameCount; ++i) {
+			playbackFiles.push_back(mine[i]);
+		}
+	}
+
+	ofLogNotice("EyeCameraStream") << config.name << ": playback loaded "
+		<< playbackFiles.size() << " frames (index-aligned) from " << sessions.size()
+		<< " session(s) in " << root;
+}
+
+//--------------------------------------------------------------
+bool EyeCameraStream::stagePlaybackFrame() {
+	// Clears the per-tick "new frame" flag and pulls the next decoded frame into
+	// the holding slot (if not already staged from an earlier tick where the
+	// other eye wasn't ready). Returns whether a frame is staged and ready.
+	playbackFrameNew = false;
+	if (!prefetcher) {
+		return false;
+	}
+	if (!hasPending) {
+		hasPending = prefetcher->tryGet(pendingPixels);
+	}
+	return hasPending;
+}
+
+void EyeCameraStream::commitPlaybackFrame() {
+	if (!hasPending) {
+		return;
+	}
+
+	// Keep the staged buffer and return the previous one to the pool so the
+	// decoder can reuse its allocation.
+	std::swap(playbackPixels, pendingPixels);
+	prefetcher->recycle(std::move(pendingPixels));
+	hasPending = false;
+
+	// Texture upload stays on the (GL) main thread, before renderTargetFbo().
+	if (!playbackTexture.isAllocated()
+		|| static_cast<int>(playbackTexture.getWidth()) != static_cast<int>(playbackPixels.getWidth())
+		|| static_cast<int>(playbackTexture.getHeight()) != static_cast<int>(playbackPixels.getHeight())) {
+		playbackTexture.allocate(playbackPixels);
+	}
+	playbackTexture.loadData(playbackPixels);
+	playbackFrameNew = true;
+}
+
+//--------------------------------------------------------------
+void EyeCameraStream::startRecording(const std::string & dir) {
+	if (playback) {
+		ofLogNotice("EyeCameraStream") << config.name << ": recording ignored (playback mode)";
+		return;
+	}
+	stopRecording();
+	// dir is relative to bin/data; create it (recursively) before writing.
+	ofDirectory::createDirectory(dir, true, true);
+	recorder = std::make_unique<FrameRecorder>();
+	recorder->start(dir, config.recordingFormat);
+	ofLogNotice("EyeCameraStream") << config.name << ": recording to " << dir;
+}
+
+//--------------------------------------------------------------
+void EyeCameraStream::stopRecording() {
+	if (recorder) {
+		recorder->stop();
+		recorder.reset();
+		ofLogNotice("EyeCameraStream") << config.name << ": recording stopped";
+	}
 }
 
 //--------------------------------------------------------------
@@ -1250,7 +1473,7 @@ void EyeCameraStream::drawRawDebug(float x, float y, float w, float h) {
 	// The raw view shows the cropped frame, so its aspect ratio and the overlay
 	// mapping both use the cropped dimensions, not the full sensor.
 	const ofRectangle cropRect = computeCropRectSource(
-		grabber.getPixels().getWidth(), grabber.getPixels().getHeight());
+		sourcePixels().getWidth(), sourcePixels().getHeight());
 	const float srcW = cropRect.width;
 	const float srcH = cropRect.height;
 	if (srcW <= 0.0f || srcH <= 0.0f) {
@@ -1278,7 +1501,7 @@ void EyeCameraStream::drawRawDebug(float x, float y, float w, float h) {
 	const float imgX = x + (w - imgW) * 0.5f;
 	const float imgY = y + (h - imgH) * 0.5f;
 
-	if (grabber.getTexture().isAllocated()) {
+	if (sourceTexture().isAllocated()) {
 		ofPushStyle();
 		ofSetColor(255);
 		ofPushMatrix();

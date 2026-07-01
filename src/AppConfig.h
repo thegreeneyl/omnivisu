@@ -19,6 +19,22 @@ public:
 		bool asyncReadback = true;        ///< PBO async FBO readback (+1 frame latency, recovers fps).
 	};
 
+	/// Dev-only: replay recorded image sequences instead of the live camera.
+	/// When enabled the grabber is never opened; frames are read from
+	/// <folder>/<session>/eye_<name>/ image sequences across all sessions.
+	struct PlaybackConfig {
+		bool enabled = false;
+		std::string folder = "recordings"; ///< Root (relative to bin/data).
+		bool loop = true;                  ///< Restart at the first frame when the last session ends.
+		float fps = 0.0f;                  ///< Target playback rate; 0 = uncapped (as fast as decode/display allow).
+	};
+
+	/// Dev-only: where raw camera frames are written while recording.
+	struct RecordingConfig {
+		std::string folder = "recordings"; ///< Root (relative to bin/data).
+		std::string format = "jpg";        ///< Image sequence extension ("jpg" or "png").
+	};
+
 	/// Parses the given config file. Returns false (and logs) if the file is
 	/// missing or unparseable; in that case all getters return their defaults.
 	bool load(const std::string & path);
@@ -31,6 +47,9 @@ public:
 
 	const StreamingConfig & getStreaming() const { return streaming; }
 
+	const PlaybackConfig & getPlayback() const { return playback; }
+	const RecordingConfig & getRecording() const { return recording; }
+
 	/// The "mask" sub-object, passed to MaskLayout::load(). Empty if absent.
 	const ofJson & getMaskJson() const { return maskJson; }
 
@@ -42,5 +61,7 @@ private:
 	ofJson mouthJson = ofJson::object();
 	std::string displayMode = "mask";
 	StreamingConfig streaming;
+	PlaybackConfig playback;
+	RecordingConfig recording;
 	bool loaded = false;
 };
