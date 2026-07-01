@@ -86,6 +86,7 @@ void ofApp::setup() {
 		panel->add(streams[i]->getTrackingParameters());
 		panel->add(streams[i]->getGradingParameters());
 		panel->add(streams[i]->getViewParameters());
+		panel->add(streams[i]->getCropParameters());
 		guis.push_back(std::move(panel));
 	}
 	layoutGuis();
@@ -95,6 +96,8 @@ void ofApp::setup() {
 		ofLogWarning("omnivisu") << "mask layout not loaded; falling back to side-by-side view";
 		viewMode = ViewMode::EyeFbo;
 	}
+
+	mouthLoaded = mouth.load(appConfig.getMouthJson());
 
 	applyStreamingConfig(appConfig.getStreaming());
 }
@@ -162,6 +165,8 @@ void ofApp::reloadConfig() {
 		ofLogWarning("omnivisu") << "mask layout not loaded on reload; using side-by-side view";
 	}
 
+	mouthLoaded = mouth.load(appConfig.getMouthJson());
+
 	// Re-apply streaming: this tears down and restarts the sender so changes to
 	// target ip/port, compression, payload size, fps cap, async readback, or the
 	// enabled flag all take effect immediately.
@@ -201,6 +206,15 @@ void ofApp::layoutGuis() {
 void ofApp::update() {
 	for (const auto & stream : streams) {
 		stream->update();
+	}
+
+	// Drive the mouth width from gaze: streams[0] = left eye -> left edge,
+	// streams[1] = right eye -> right edge.
+	if (mouthLoaded) {
+		const float leftGaze = streams.size() > 0 ? streams[0]->getGazeX() : 0.0f;
+		const float rightGaze = streams.size() > 1 ? streams[1]->getGazeX() : 0.0f;
+		mouth.setGaze(leftGaze, rightGaze);
+		mouth.update(static_cast<float>(ofGetLastFrameTime()));
 	}
 
 	const float now = ofGetElapsedTimef();
@@ -369,6 +383,12 @@ void ofApp::drawMasked() {
 
 	ofEnableAlphaBlending();
 	maskLayout.drawMask(sl);
+
+	// The mouth lives in the same image-pixel space as the mask, so it reuses
+	// the cover-fit transform and draws on top of the mask.
+	if (mouthLoaded) {
+		mouth.draw(sl.scale, sl.imgX, sl.imgY);
+	}
 }
 
 //--------------------------------------------------------------

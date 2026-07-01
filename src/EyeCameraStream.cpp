@@ -80,6 +80,14 @@ void EyeCameraStream::setupParameters() {
 	parameters.viewGroup.add(parameters.followSmoothing);
 	parameters.group.add(parameters.viewGroup);
 
+	parameters.cropGroup.clear();
+	parameters.cropGroup.setName("crop");
+	parameters.cropGroup.add(parameters.cropTop);
+	parameters.cropGroup.add(parameters.cropRight);
+	parameters.cropGroup.add(parameters.cropBottom);
+	parameters.cropGroup.add(parameters.cropLeft);
+	parameters.group.add(parameters.cropGroup);
+
 	parameters.fboGroup.clear();
 	parameters.fboGroup.setName("fbo");
 	parameters.fboGroup.add(parameters.fboWidth);
@@ -248,6 +256,43 @@ std::string EyeCameraStream::paramsFilePath() const {
 }
 
 //--------------------------------------------------------------
+ofRectangle EyeCameraStream::computeCropRectSource(float fullW, float fullH) const {
+	if (fullW <= 0.0f || fullH <= 0.0f) {
+		return ofRectangle(0.0f, 0.0f, std::max(0.0f, fullW), std::max(0.0f, fullH));
+	}
+
+	float top = clamp01(parameters.cropTop.get());
+	float right = clamp01(parameters.cropRight.get());
+	float bottom = clamp01(parameters.cropBottom.get());
+	float left = clamp01(parameters.cropLeft.get());
+
+	// Never crop the frame away entirely: keep at least a thin sliver on each
+	// axis by scaling opposing edges down if they together reach the full size.
+	constexpr float kMaxAxis = 0.95f;
+	if (left + right > kMaxAxis) {
+		const float s = kMaxAxis / (left + right);
+		left *= s;
+		right *= s;
+	}
+	if (top + bottom > kMaxAxis) {
+		const float s = kMaxAxis / (top + bottom);
+		top *= s;
+		bottom *= s;
+	}
+
+	// Crop directions are display-oriented; the sensor is non-mirrored, so swap
+	// left/right when the display is mirrored (matches eye_center_offset_x).
+	const float srcLeftFrac = config.mirrorX ? right : left;
+	const float srcRightFrac = config.mirrorX ? left : right;
+
+	const float x = std::round(srcLeftFrac * fullW);
+	const float y = std::round(top * fullH);
+	const float w = std::max(1.0f, std::round(fullW - (srcLeftFrac + srcRightFrac) * fullW));
+	const float h = std::max(1.0f, std::round(fullH - (top + bottom) * fullH));
+	return ofRectangle(x, y, w, h);
+}
+
+//--------------------------------------------------------------
 bool EyeCameraStream::loadParameters() {
 	const auto path = ofToDataPath(paramsFilePath(), true);
 	if (!ofFile::doesFileExist(path)) {
@@ -309,7 +354,13 @@ ofxCvBlob EyeCameraStream::pickBestEyeBlob(const std::vector<ofxCvBlob> & blobs)
 		return {};
 	}
 
-	const ofRectangle frame(0, 0, grabber.getPixels().getWidth(), grabber.getPixels().getHeight());
+	// Normalize against the cropped detection frame (what the worker actually
+	// sees), falling back to the full sensor before the first cropped dispatch.
+	const float frameW = activeCropW.load() > 0 ? static_cast<float>(activeCropW.load())
+		: static_cast<float>(grabber.getPixels().getWidth());
+	const float frameH = activeCropH.load() > 0 ? static_cast<float>(activeCropH.load())
+		: static_cast<float>(grabber.getPixels().getHeight());
+	const ofRectangle frame(0, 0, frameW, frameH);
 	const float frameDiagSq = frame.width * frame.width + frame.height * frame.height;
 
 	ofxCvBlob best = blobs.front();
@@ -780,7 +831,12 @@ EyeCameraStream::IrisCandidate EyeCameraStream::pickBestIris(
 		return {};
 	}
 
-	const ofRectangle frame(0, 0, grabber.getPixels().getWidth(), grabber.getPixels().getHeight());
+	// Normalize against the cropped detection frame (see pickBestEyeBlob).
+	const float frameW = activeCropW.load() > 0 ? static_cast<float>(activeCropW.load())
+		: static_cast<float>(grabber.getPixels().getWidth());
+	const float frameH = activeCropH.load() > 0 ? static_cast<float>(activeCropH.load())
+		: static_cast<float>(grabber.getPixels().getHeight());
+	const ofRectangle frame(0, 0, frameW, frameH);
 	const float frameDiagSq = frame.width * frame.width + frame.height * frame.height;
 	const float expected = std::max(1.0f, static_cast<float>(parameters.irisExpectedRadius.get()));
 
@@ -828,6 +884,27 @@ bool EyeCameraStream::onPreferredSide(float srcX, float srcW) const {
 	const float nx = (srcW > 0.0f) ? srcX / srcW : 0.5f;
 	const float dispNx = config.mirrorX ? (1.0f - nx) : nx;
 	return (side == 1) ? (dispNx < 0.5f) : (dispNx >= 0.5f);
+}
+
+//--------------------------------------------------------------
+float EyeCameraStream::getGazeX() const {
+	std::lock_guard<std::mutex> lk(stateMutex);
+	// Only report a live gaze while the eye is present; otherwise neutral so the
+	// driven feature relaxes to its centered state during dropouts.
+	if (!result.present) {
+		return 0.0f;
+	}
+	const float halfW = result.eyeBox.width * 0.5f;
+	if (halfW <= 1.0f || result.irisRadiusPx <= 0.0f) {
+		return 0.0f; // no eye box or no fitted iris (e.g. haar mode).
+	}
+	float gaze = (result.irisCenter.x - result.eyeCenter.x) / halfW;
+	// eyeCenter/irisCenter live in non-mirrored source px; flip so positive
+	// always means "looking right" in the mirrored display the user sees.
+	if (config.mirrorX) {
+		gaze = -gaze;
+	}
+	return gaze;
 }
 
 //--------------------------------------------------------------
@@ -914,8 +991,12 @@ void EyeCameraStream::renderTargetFbo() {
 	const float fboW = static_cast<float>(config.fboSize.x);
 	const float fboH = static_cast<float>(config.fboSize.y);
 
-	const float srcW = grabber.getTexture().getWidth();
-	const float srcH = grabber.getTexture().getHeight();
+	// Crop sub-rectangle of the full sensor frame; all fit/follow math below
+	// works in cropped-source space so the FBO shows only the cropped image.
+	const ofRectangle cropRect = computeCropRectSource(
+		grabber.getTexture().getWidth(), grabber.getTexture().getHeight());
+	const float srcW = cropRect.width;
+	const float srcH = cropRect.height;
 	float drawW = fboW;
 	float drawH = fboH;
 	float drawX = 0.0f;
@@ -1011,13 +1092,14 @@ void EyeCameraStream::renderTargetFbo() {
 		ofTranslate(fboW, 0.0f);
 		ofScale(-1.0f, 1.0f);
 	}
-	drawCameraIntoFbo(drawX, drawY, drawW, drawH);
+	drawCameraIntoFbo(drawX, drawY, drawW, drawH, cropRect);
 	ofPopMatrix();
 	targetFbo.end();
 }
 
 //--------------------------------------------------------------
-void EyeCameraStream::drawCameraIntoFbo(float drawX, float drawY, float drawW, float drawH) {
+void EyeCameraStream::drawCameraIntoFbo(float drawX, float drawY, float drawW, float drawH,
+		const ofRectangle & srcRect) {
 	const ofTexture & tex = grabber.getTexture();
 
 	// Lazy-build shader once the texture target is known. Rebuild if the target
@@ -1027,9 +1109,12 @@ void EyeCameraStream::drawCameraIntoFbo(float drawX, float drawY, float drawW, f
 		gradeShaderLoaded = buildGradeShader(needsRect);
 	}
 
+	// drawSubsection samples only the cropped sub-rectangle of the sensor frame,
+	// so the crop is applied to the displayed image (FBO + raw debug view).
 	const bool useShader = parameters.enableGrading && gradeShaderLoaded;
 	if (!useShader) {
-		tex.draw(drawX, drawY, drawW, drawH);
+		tex.drawSubsection(drawX, drawY, drawW, drawH,
+			srcRect.x, srcRect.y, srcRect.width, srcRect.height);
 		return;
 	}
 
@@ -1040,7 +1125,8 @@ void EyeCameraStream::drawCameraIntoFbo(float drawX, float drawY, float drawW, f
 	gradeShader.setUniform1f("uContrast", parameters.gradeContrast.get());
 	gradeShader.setUniform1f("uGamma", std::max(0.01f, parameters.gradeGamma.get()));
 	gradeShader.setUniform1f("uSaturation", parameters.gradeSaturation.get());
-	tex.draw(drawX, drawY, drawW, drawH);
+	tex.drawSubsection(drawX, drawY, drawW, drawH,
+		srcRect.x, srcRect.y, srcRect.width, srcRect.height);
 	gradeShader.end();
 }
 
@@ -1124,7 +1210,20 @@ void EyeCameraStream::update() {
 	}
 
 	FrameJob job;
-	job.pixels = grabber.getPixels();
+	// Crop the raw frame *before* detection so the worker never sees the
+	// inter-camera overlap (the opposite eye), and so detection coordinates
+	// already live in the same cropped space the FBO/overlay display.
+	const ofPixels & full = grabber.getPixels();
+	const ofRectangle cr = computeCropRectSource(full.getWidth(), full.getHeight());
+	if (cr.x <= 0.0f && cr.y <= 0.0f
+		&& cr.width >= full.getWidth() && cr.height >= full.getHeight()) {
+		job.pixels = full; // no crop: avoid an extra copy.
+	} else {
+		full.cropTo(job.pixels, static_cast<int>(cr.x), static_cast<int>(cr.y),
+			static_cast<int>(cr.width), static_cast<int>(cr.height));
+	}
+	activeCropW = static_cast<int>(job.pixels.getWidth());
+	activeCropH = static_cast<int>(job.pixels.getHeight());
 	job.captureTime = ofGetElapsedTimef();
 	frameJobs.send(std::move(job));
 
@@ -1148,8 +1247,12 @@ void EyeCameraStream::drawDebug(float x, float y, float w, float h) const {
 
 //--------------------------------------------------------------
 void EyeCameraStream::drawRawDebug(float x, float y, float w, float h) {
-	const float srcW = grabber.getPixels().getWidth();
-	const float srcH = grabber.getPixels().getHeight();
+	// The raw view shows the cropped frame, so its aspect ratio and the overlay
+	// mapping both use the cropped dimensions, not the full sensor.
+	const ofRectangle cropRect = computeCropRectSource(
+		grabber.getPixels().getWidth(), grabber.getPixels().getHeight());
+	const float srcW = cropRect.width;
+	const float srcH = cropRect.height;
 	if (srcW <= 0.0f || srcH <= 0.0f) {
 		ofPushStyle();
 		ofSetColor(255);
@@ -1187,7 +1290,7 @@ void EyeCameraStream::drawRawDebug(float x, float y, float w, float h) {
 		}
 		// Reuses the grade shader path so the raw view honours the same color
 		// grading as the cropped FBO view (or direct draw when grading is off).
-		drawCameraIntoFbo(imgX, imgY, imgW, imgH);
+		drawCameraIntoFbo(imgX, imgY, imgW, imgH, cropRect);
 		ofPopMatrix();
 		ofPopStyle();
 	}

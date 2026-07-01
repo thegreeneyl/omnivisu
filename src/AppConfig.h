@@ -34,8 +34,12 @@ public:
 	/// The "mask" sub-object, passed to MaskLayout::load(). Empty if absent.
 	const ofJson & getMaskJson() const { return maskJson; }
 
+	/// The "mouth" sub-object, passed to Mouth::load(). Empty if absent.
+	const ofJson & getMouthJson() const { return mouthJson; }
+
 private:
 	ofJson maskJson = ofJson::object();
+	ofJson mouthJson = ofJson::object();
 	std::string displayMode = "mask";
 	StreamingConfig streaming;
 	bool loaded = false;

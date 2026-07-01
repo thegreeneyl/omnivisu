@@ -69,12 +69,21 @@ public:
 		std::lock_guard<std::mutex> lk(stateMutex);
 		return result;
 	}
+	/// Normalized horizontal gaze of the pupil within the eye opening, in
+	/// DISPLAY orientation: 0 = centered, negative = looking left, positive =
+	/// looking right (mirror-corrected so it matches what the user sees).
+	/// Defined as (irisCenter.x - eyeCenter.x) / (eyeBox.width / 2), i.e. the
+	/// pupil center relative to the (offset-shifted) eye center. Returns 0 when
+	/// there is no current detection or no fitted iris.
+	float getGazeX() const;
+
 	const ofxIdsPeak::Grabber & getGrabber() const { return grabber; }
 	ofParameterGroup & getParameters() { return parameters.group; }
 	ofParameterGroup & getGrabberParameters() { return grabber.parameters.group; }
 	ofParameterGroup & getTrackingParameters() { return parameters.trackingGroup; }
 	ofParameterGroup & getGradingParameters() { return parameters.gradingGroup; }
 	ofParameterGroup & getViewParameters() { return parameters.viewGroup; }
+	ofParameterGroup & getCropParameters() { return parameters.cropGroup; }
 	const std::string & getName() const { return config.name; }
 
 	bool saveParameters() const;
@@ -182,6 +191,18 @@ private:
 		ofParameter<bool> followEye{"follow eye", false};
 		ofParameter<float> followSmoothing{"follow smoothing", 0.5f, 0.0f, 1.0f};
 
+		// Per-edge crop of the raw camera frame, as a fraction of the full
+		// sensor dimension (0 = no crop, 0.9 = trim 90% off that edge). Applied
+		// to the frame *before* detection and rendering, so it both reduces the
+		// inter-camera overlap seen by the detector and changes the displayed
+		// image ratio. Directions are in DISPLAY orientation (mirror-aware), so
+		// "right" is the right edge of what the user sees.
+		ofParameterGroup cropGroup{"crop"};
+		ofParameter<float> cropTop{"top", 0.0f, 0.0f, 0.9f};
+		ofParameter<float> cropRight{"right", 0.0f, 0.0f, 0.9f};
+		ofParameter<float> cropBottom{"bottom", 0.0f, 0.0f, 0.9f};
+		ofParameter<float> cropLeft{"left", 0.0f, 0.0f, 0.9f};
+
 		// FBO (per-eye render target) dimensions. Read from JSON at setup time
 		// and applied to Config::fboSize before allocation. Not added to the
 		// runtime GUI because changing them only takes effect on startup.
@@ -230,7 +251,12 @@ private:
 	void threadedFunction() override;
 	void resetWorkerStateLocked();
 	bool buildGradeShader(bool useRect);
-	void drawCameraIntoFbo(float drawX, float drawY, float drawW, float drawH);
+	void drawCameraIntoFbo(float drawX, float drawY, float drawW, float drawH,
+		const ofRectangle & srcRect);
+	/// Translates the per-edge crop fractions into a source-pixel sub-rectangle
+	/// of the full frame (fullW x fullH). Mirror-aware: left/right are swapped
+	/// when config.mirrorX is set so the directions match the displayed image.
+	ofRectangle computeCropRectSource(float fullW, float fullH) const;
 	/// Shared detection overlay (box, center cross, presence/worker stats),
 	/// mapping source pixels into the given on-screen image rect. dispX/dispY is
 	/// the display-quad origin used for the state/heartbeat text.
@@ -297,4 +323,10 @@ private:
 
 	std::atomic<std::uint64_t> detectionsRun{0};
 	std::atomic<std::uint64_t> detectionsValid{0};
+
+	// Dimensions (px) of the cropped frame handed to the most recent detection
+	// job, so the worker normalizes distances against the cropped frame rather
+	// than the full sensor. 0 until the first cropped frame is dispatched.
+	std::atomic<int> activeCropW{0};
+	std::atomic<int> activeCropH{0};
 };

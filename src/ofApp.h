@@ -7,6 +7,7 @@
 #include "EyeCameraStream.h"
 #include "EyeStreamSender.h"
 #include "MaskLayout.h"
+#include "Mouth.h"
 
 #include <memory>
 #include <vector>
@@ -41,11 +42,13 @@ private:
 	std::vector<std::unique_ptr<ofxPanel>> guis;
 	AppConfig appConfig;
 	MaskLayout maskLayout;
+	Mouth mouth;
 	// View cycled by the 'm' key: mask overlay -> cropped eye FBOs -> raw graded
 	// camera (each with the detection overlay where applicable).
 	enum class ViewMode { Mask, EyeFbo, RawCamera };
 	ViewMode viewMode = ViewMode::Mask;
 	bool maskLoaded = false;
+	bool mouthLoaded = false;
 	bool showGui = false;
 	bool showFps = false;
 	float lastFpsLogTime = 0.0f;

@@ -3,7 +3,7 @@
         "display_mode": "mask"
     },
     "streaming": {
-        "enabled": false,
+        "enabled": true,
         "target_ip": "192.168.178.103",
         "target_port": 12345,
         "compression": "jpeg",
@@ -17,5 +17,19 @@
         "anchor":     { "x": 2000, "y": 1500 },
         "left_eye":   { "x": 1030, "y": 1073, "w": 414, "h": 280 },
         "right_eye":  { "x": 2551, "y": 1071, "w": 414, "h": 280 }
+    },
+    "mouth": {
+        "size": { "w": 2500, "h": 38 },
+        "anchor":     { "x": 2000, "y": 2015 },
+        "color": { "r": 255, "g": 255, "b": 255, "a": 150 },
+        "control": {
+            "gaze_in_min": -0.5,
+            "gaze_in_max": 0.5,
+            "left_edge_extend": -1.0,
+            "left_edge_retract": 0.333,
+            "right_edge_retract": -0.333,
+            "right_edge_extend": 1.0,
+            "smoothing": 0.0
+        }
     }
 }

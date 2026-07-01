@@ -43,6 +43,10 @@ bool AppConfig::load(const std::string & path) {
 		maskJson = json["mask"];
 	}
 
+	if (json.contains("mouth")) {
+		mouthJson = json["mouth"];
+	}
+
 	loaded = true;
 	ofLogNotice("AppConfig") << "loaded " << path << " (display_mode=" << displayMode
 		<< ", streaming=" << (streaming.enabled ? "on" : "off")
