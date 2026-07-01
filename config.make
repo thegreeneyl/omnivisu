@@ -149,22 +149,27 @@
 ################################################################################
 # CAMERA-LESS BUILD (macOS / any machine without the IDS peak SDK)
 #
-# The ofxIdsPeak addon pulls in the Linux-only IDS peak SDK headers
-# (<peak/peak.hpp>), so it cannot compile on macOS. To build/run there for
-# development, drive the app entirely from recorded image sequences instead of
-# the live camera:
+# The ofxIdsPeak addon wraps the Linux-only IDS peak SDK (<peak/peak.hpp>), so
+# it cannot drive a live camera on macOS. Rather than editing files by hand
+# when moving between machines, the camera-less path is now selected
+# automatically from the host OS:
 #
-#   1. In this project's addons.make, remove the "ofxIdsPeak" line (leave
-#      ofxGui, ofxOpenCv, ofxNetwork) so the SDK is never compiled/linked.
-#   2. Uncomment the define below. It compiles out every grabber reference and
-#      forces disk playback on (see EyeCameraStream / OMNIVISU_NO_CAMERA).
-#   3. Regenerate/build with a macOS openFrameworks install (this folder is the
-#      linux64 release; the Linux build is unaffected by the steps above).
+#   * On Linux the app builds against ofxIdsPeak and uses the live camera.
+#   * On any non-Linux host (macOS) OMNIVISU_NO_CAMERA is defined below. That
+#     compiles out every grabber reference and forces disk playback on (see
+#     EyeCameraStream / OMNIVISU_NO_CAMERA). The ofxIdsPeak addon also excludes
+#     its own Linux-only sources on macOS (see addons/ofxIdsPeak/addon_config.mk),
+#     so leaving "ofxIdsPeak" in addons.make is harmless there.
 #
-# With OMNIVISU_NO_CAMERA defined the "playback" block in config.json is
+# When OMNIVISU_NO_CAMERA is active the "playback" block in config.json is
 # implied; put recorded sessions under bin/data/recordings/<timestamp>/eye_*/.
 #
-# PROJECT_DEFINES += OMNIVISU_NO_CAMERA
+# HOST_OS is resolved with uname because the openFrameworks PLATFORM_OS variable
+# is not populated yet at the point this project config.make is read.
+HOST_OS := $(shell uname -s)
+ifneq ($(HOST_OS),Linux)
+    PROJECT_DEFINES += OMNIVISU_NO_CAMERA
+endif
 
 # vscode template
 
