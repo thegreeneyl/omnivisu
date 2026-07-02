@@ -8,6 +8,7 @@
 #include "EyeStreamSender.h"
 #include "MaskLayout.h"
 #include "Mouth.h"
+#include "PlaybackController.h"
 
 #include <memory>
 #include <vector>
@@ -38,13 +39,16 @@ private:
 	void applyStreamingConfig(const AppConfig::StreamingConfig & sc);
 	void reloadConfig();
 	void toggleRecording();
-	void advancePlaybackLockstep();
 
 	std::vector<std::unique_ptr<EyeCameraStream>> streams;
 	std::vector<std::unique_ptr<ofxPanel>> guis;
 	AppConfig appConfig;
 	MaskLayout maskLayout;
 	Mouth mouth;
+	// Playback transport: owns the shared timeline and drives the lockstep
+	// advance / pause / frame stepping across every eye's PlaybackSource.
+	// Inactive (no-op) whenever any stream is live capture.
+	PlaybackController playbackCtl;
 	// View cycled by the 'm' key: mask overlay -> cropped eye FBOs -> raw graded
 	// camera (each with the detection overlay where applicable).
 	enum class ViewMode { Mask, EyeFbo, RawCamera };
@@ -53,12 +57,8 @@ private:
 	bool mouthLoaded = false;
 	bool showGui = false;
 	bool showFps = false;
-	// Dev-only: raw camera recording toggle (spacebar). See toggleRecording().
+	// Raw camera recording toggle (spacebar in live capture). See toggleRecording().
 	bool recording = false;
-	// Dev-only: disk-playback frame-rate cap (0 = uncapped) and its fixed-grid
-	// schedule. See advancePlaybackLockstep().
-	float playbackFps = 0.0f;
-	float nextPlaybackFrameTime = 0.0f;
 	float lastFpsLogTime = 0.0f;
 
 	// Eye video streaming. The combined stream FBO holds the two eyes

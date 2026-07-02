@@ -19,8 +19,8 @@ public:
 		bool asyncReadback = true;        ///< PBO async FBO readback (+1 frame latency, recovers fps).
 	};
 
-	/// Dev-only: replay recorded image sequences instead of the live camera.
-	/// When enabled the grabber is never opened; frames are read from
+	/// Replay recorded image sequences instead of the live camera. When
+	/// enabled the camera is never opened; frames are read from
 	/// <folder>/<session>/eye_<name>/ image sequences across all sessions.
 	struct PlaybackConfig {
 		bool enabled = false;
@@ -29,7 +29,7 @@ public:
 		float fps = 0.0f;                  ///< Target playback rate; 0 = uncapped (as fast as decode/display allow).
 	};
 
-	/// Dev-only: where raw camera frames are written while recording.
+	/// Where raw camera frames are written while recording (live capture).
 	struct RecordingConfig {
 		std::string folder = "recordings"; ///< Root (relative to bin/data).
 		std::string format = "jpg";        ///< Image sequence extension ("jpg" or "png").

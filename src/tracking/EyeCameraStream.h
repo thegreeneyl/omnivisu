@@ -3,23 +3,27 @@
 #include "ofMain.h"
 #include "ofxGui.h"
 #include "ofxOpenCv.h"
+#include "FrameSource.h"
+#include "PlaybackSource.h"
 #if !defined(OMNIVISU_NO_CAMERA)
-#include "ofxIdsPeak.h"
+#include "LiveCameraSource.h"
 #endif
 #include "OneEuroFilter.h"
 
 #include <opencv2/imgproc.hpp>
+#include <opencv2/dnn.hpp>
+#include <opencv2/objdetect.hpp>
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
-/// One camera stream: capture (main thread), eye detection (worker thread),
+/// One eye stream: frame acquisition through an IFrameSource (live IDS camera
+/// or disk playback, chosen at setup), eye detection (worker thread), and the
 /// full-frame letterboxed render to FBO (main thread).
 /// Detection runs one of two selectable strategies (see Parameters::detectorMode):
 ///   - iris: classical iris/limbus ellipse fit (default) -> center, radius, fit
@@ -41,14 +45,14 @@ public:
 		std::string paramsFile;
 		bool mirrorX = true;
 
-		// Dev-only frame source / recording. When playbackEnabled is set (or the
-		// build defines OMNIVISU_NO_CAMERA) the grabber is never opened and
-		// frames are read from disk instead. recordingFolder/Format are only used
-		// while recording the live camera.
+		// Frame source. When playbackEnabled is set (or the build defines
+		// OMNIVISU_NO_CAMERA) the camera is never opened and frames come from
+		// playbackFiles (this eye's index-aligned list, built by the shared
+		// PlaybackTimeline). recordingFormat is only used while recording the
+		// live camera.
 		bool playbackEnabled = false;
-		std::string playbackFolder = "recordings";
+		std::vector<std::string> playbackFiles;
 		bool playbackLoop = true;
-		std::string recordingFolder = "recordings";
 		std::string recordingFormat = "jpg";
 	};
 
@@ -95,8 +99,8 @@ public:
 	float getGazeX() const;
 
 #if !defined(OMNIVISU_NO_CAMERA)
-	const ofxIdsPeak::Grabber & getGrabber() const { return grabber; }
-	ofParameterGroup & getGrabberParameters() { return grabber.parameters.group; }
+	const ofxIdsPeak::Grabber & getGrabber() const { return liveSource->grabber(); }
+	ofParameterGroup & getGrabberParameters() { return liveSource->grabber().parameters.group; }
 #endif
 	ofParameterGroup & getParameters() { return parameters.group; }
 	ofParameterGroup & getTrackingParameters() { return parameters.trackingGroup; }
@@ -108,24 +112,26 @@ public:
 	bool saveParameters() const;
 	bool loadParameters();
 
-	/// True when this stream is fed by on-disk recordings (grabber not opened).
+	/// True when this stream is fed by on-disk recordings (camera not opened).
 	bool isPlayback() const { return playback; }
 
-	/// Two-phase, app-coordinated playback advance that keeps every eye locked
-	/// to the same frame index. stagePlaybackFrame() pulls the next decoded
-	/// frame into a holding slot and returns true once one is ready;
-	/// commitPlaybackFrame() swaps it in and uploads the texture. The app only
-	/// commits after *every* eye has a frame staged, so per-eye decode-rate
-	/// differences can no longer desync them.
-	bool stagePlaybackFrame();
-	void commitPlaybackFrame();
+	/// The playback source when in playback mode, nullptr in live capture.
+	/// Transport (lockstep advance, stepping, seeking) is coordinated across
+	/// eyes by the app-level PlaybackController through this pointer.
+	PlaybackSource * playbackSource() { return playbackSrc.get(); }
 
-	/// Dev-only recording of the raw camera frames to an image sequence in `dir`
+	/// Recording of the raw camera frames to an image sequence in `dir`
 	/// (relative to bin/data). No-op in playback mode. Writing happens on a
 	/// background thread so capture is never stalled.
 	void startRecording(const std::string & dir);
 	void stopRecording();
-	bool isRecording() const { return recorder != nullptr; }
+	bool isRecording() const {
+#if !defined(OMNIVISU_NO_CAMERA)
+		return liveSource && liveSource->isRecording();
+#else
+		return false;
+#endif
+	}
 
 	std::uint64_t getDetectionCount() const { return detectionsRun.load(); }
 	std::uint64_t getValidDetectionCount() const { return detectionsValid.load(); }
@@ -173,13 +179,51 @@ private:
 		ofParameter<bool> enableEyeTracking{"enable eye tracking", true};
 		ofParameter<bool> showDebugOverlay{"show debug overlay", true};
 		// Active detector: 0 = pure iris/limbus, 1 = legacy Haar cascade,
-		// 2 = Haar eye box with iris located inside it (default).
-		ofParameter<int> detectorMode{"detector mode", 2, 0, 2};
+		// 2 = Haar eye box with classical iris located inside it (default),
+		// 3 = Haar eye box with a MediaPipe-Iris ONNX model locating the iris
+		//     inside it (falls back to mode 2 if the model is missing/fails),
+		// 4 = MediaPipe-Iris ONNX model run directly on a centered region of
+		//     the frame, with NO Haar step. Useful when Haar misses on a
+		//     tightly-framed single-eye camera. Reports no detection if the
+		//     model is unavailable.
+		// 5 = Haar-seeded, iris-TRACKED DNN (recommended over 3): Haar is only
+		//     used to (re)acquire; once locked, each frame crops a stable ROI
+		//     around the eye and runs the model there, so per-frame Haar
+		//     brittleness (the "downscale value" cliff) and extreme-gaze
+		//     dropouts no longer break tracking. Falls back to mode 2 if the
+		//     model is unavailable.
+		ofParameter<int> detectorMode{"detector mode", 2, 0, 5};
+		// Path (relative to bin/data) of the ONNX iris-landmark model used by
+		// detector modes 3 and 4. Loaded lazily the first time it is needed.
+		// Leave the file absent to make mode 3 transparently behave like mode 2.
+		ofParameter<std::string> irisDnnModel{"iris dnn model", "models/iris_landmark.onnx"};
+		// Mode 4 only: the search region is a centered rectangle covering this
+		// fraction of the (cropped) frame. 1.0 = whole frame; lower values zoom
+		// into the center so the eye fills more of the model's 64x64 input.
+		ofParameter<float> irisRoiScale{"iris roi scale", 1.0f, 0.1f, 1.0f};
+		// Mode 5 (tracked DNN) tuning:
+		// - track margin: the tracked ROI side = max(seed eye-box side) * this.
+		//   Larger = more room for the iris to travel at extreme gaze before it
+		//   leaves the crop (at the cost of a smaller eye in the 64x64 input).
+		// - track min quality: quality gate WHILE tracking. Deliberately looser
+		//   than iris_min_fit_quality so a partly eyelid-occluded corner-gaze
+		//   iris is kept instead of dropped.
+		// - track lost frames: consecutive tracking failures tolerated before
+		//   the tracker gives up and falls back to Haar re-acquisition.
+		ofParameter<float> irisTrackMargin{"iris track margin", 1.8f, 1.0f, 4.0f};
+		ofParameter<float> irisTrackMinQuality{"iris track min quality", 0.08f, 0.0f, 1.0f};
+		ofParameter<int> irisTrackLostFrames{"iris track lost frames", 6, 1, 60};
 		ofParameter<int> trackingDownscale{"tracking downscale", 8, 1, 16};
 		ofParameter<int> haarMinWidth{"haar min width", 400, 8, 1000};
 		ofParameter<int> haarMinHeight{"haar min height", 250, 8, 1000};
 		ofParameter<float> haarScale{"haar scale", 1.01f, 1.001f, 1.5f};
 		ofParameter<int> haarNeighbors{"haar neighbors", 5, 0, 20};
+		// When set (mode 3, and mode 5 re-acquisition), run the Haar cascade at
+		// several image resolutions each frame and merge the hits, instead of
+		// only at 1/tracking_downscale. This smooths out the discontinuous "some
+		// downscale values find nothing" behaviour of a single-scale cascade at
+		// the cost of a few extra (cheap) detections per frame.
+		ofParameter<bool> haarMultiScale{"haar multi scale", false};
 		// Iris detector tuning. The expected radius is in *source* pixels for
 		// intuitive tuning; the detector converts to detection scale internally.
 		// threshold mode: 0 = adaptive, 1 = Otsu, 2 = fixed (iris threshold).
@@ -261,131 +305,12 @@ private:
 		float captureTime = 0.0f;
 	};
 
-	/// Dev-only background frame saver. Owns its own thread and channel so a
-	/// fresh instance is created per recording session (an ofThreadChannel
-	/// cannot be reopened once closed). Writes zero-padded image sequences.
-	class FrameRecorder : public ofThread {
-	public:
-		~FrameRecorder() override { stop(); }
-		void start(const std::string & dir, const std::string & format) {
-			outDir = dir;
-			fmt = format.empty() ? "jpg" : format;
-			startThread();
-		}
-		void stop() {
-			channel.close();
-			if (isThreadRunning()) {
-				waitForThread(false);
-			}
-		}
-		void enqueue(const ofPixels & px) { channel.send(px); }
-
-	protected:
-		void threadedFunction() override {
-			ofPixels px;
-			std::size_t idx = 0;
-			while (channel.receive(px)) {
-				char name[48];
-				std::snprintf(name, sizeof(name), "/frame_%06zu.", idx++);
-				ofSaveImage(px, outDir + name + fmt, OF_IMAGE_QUALITY_BEST);
-			}
-		}
-
-	private:
-		ofThreadChannel<ofPixels> channel;
-		std::string outDir;
-		std::string fmt = "jpg";
-	};
-
-	/// Dev-only background frame decoder for playback. JPEG/PNG decode is the
-	/// playback bottleneck, so it is pulled off the render thread: this thread
-	/// reads ahead through the ordered frame list and decodes into a bounded
-	/// pool of reusable ofPixels buffers. The main thread pops the next decoded
-	/// frame (non-blocking), uploads it to a texture, and returns the buffer.
-	/// The `empty` pool caps how many frames may be in flight, so a fast disk
-	/// cannot run the decoder ahead without bound.
-	class FramePrefetcher : public ofThread {
-	public:
-		~FramePrefetcher() override { stop(); }
-
-		void start(std::vector<std::string> files, bool loop, int depth, const std::string & tag) {
-			playlist = std::move(files);
-			loopPlayback = loop;
-			name = tag;
-			cursor = 0;
-			for (int i = 0; i < std::max(1, depth); ++i) {
-				empty.send(ofPixels());
-			}
-			startThread();
-		}
-		void stop() {
-			empty.close();
-			filled.close();
-			if (isThreadRunning()) {
-				waitForThread(false);
-			}
-		}
-		/// Non-blocking: moves the next decoded frame into `out` if one is ready.
-		bool tryGet(ofPixels & out) { return filled.tryReceive(out); }
-		/// Returns a consumed buffer to the pool for reuse.
-		void recycle(ofPixels && buf) { empty.send(std::move(buf)); }
-
-	protected:
-		void threadedFunction() override {
-			ofPixels buf;
-			bool haveBuf = false;
-			while (true) {
-				if (!haveBuf) {
-					if (!empty.receive(buf)) {
-						break; // pool closed by stop().
-					}
-					haveBuf = true;
-				}
-				if (playlist.empty()) {
-					break;
-				}
-				if (cursor >= playlist.size()) {
-					if (!loopPlayback) {
-						break; // exhausted; main thread holds the last frame.
-					}
-					cursor = 0;
-				}
-				const std::string path = playlist[cursor++];
-				if (ofLoadImage(buf, path)) {
-					// Match the live camera's RGB output for an identical pipeline.
-					if (buf.getNumChannels() != 3) {
-						buf.setNumChannels(3);
-					}
-					if (!filled.send(std::move(buf))) {
-						break; // queue closed by stop().
-					}
-					haveBuf = false; // buf was moved out; fetch a fresh one.
-				} else {
-					ofLogWarning("EyeCameraStream") << name
-						<< ": failed to load playback frame " << path;
-					// keep the buffer and try the next frame.
-				}
-			}
-		}
-
-	private:
-		ofThreadChannel<ofPixels> empty;  // reusable buffer pool (bounds prefetch depth).
-		ofThreadChannel<ofPixels> filled; // decoded frames ready for the main thread.
-		std::vector<std::string> playlist;
-		std::size_t cursor = 0;
-		bool loopPlayback = true;
-		std::string name;
-	};
-
 	void setupParameters();
-	/// Current frame source, transparently either the live grabber or the
-	/// on-disk playback buffers. Everything downstream reads through these.
+	/// Null-safe reads through the active frame source (live camera or disk
+	/// playback). Everything downstream reads frames through these.
 	const ofPixels & sourcePixels() const;
 	const ofTexture & sourceTexture() const;
 	bool sourceFrameNew() const;
-	/// Scans the playback folder once at setup, building this eye's ordered,
-	/// flat list of frame files across every recorded session subfolder.
-	void buildPlaybackList();
 	bool detectEye(const ofPixels & pixels, RawDetection & out);
 	/// Haar cascade detection on the prepared `cvGray` image. Fills `out` and
 	/// returns true on a valid hit. (Legacy path, kept for A/B comparison.)
@@ -397,6 +322,42 @@ private:
 	/// inside each box. Boxes without a valid iris are discarded (false-positive
 	/// rejection). Eye box = anchor, iris = gaze source.
 	bool detectEyeBoxIris(int downscale, int srcW, int srcH, RawDetection & out);
+	/// Runs the Haar eye cascade on `graySrc` (full-res grayscale) at several
+	/// down-sampling factors around tracking_downscale and appends every hit,
+	/// mapped to source px, to `boxes`. Used by the multi-scale seeding path so
+	/// a single Haar scale-cliff can't drop the eye. Uses its own classifier
+	/// (irisHaarCascade) so the default single-scale eyeFinder path is untouched.
+	void collectHaarBoxesMultiScale(const cv::Mat & graySrc, int srcW, int srcH,
+		std::vector<ofRectangle> & boxes);
+	/// Combined DNN detector (mode 3): Haar gives candidate eye boxes; a
+	/// MediaPipe-Iris ONNX model locates the iris on the full-resolution RGB
+	/// crop of each box. Boxes whose iris fails the plausibility gate are
+	/// discarded. Falls back to detectEyeBoxIris() whenever the model is
+	/// unavailable, so enabling mode 3 can never break tracking. `src` is the
+	/// full (cropped) source frame in source-pixel coordinates.
+	bool detectEyeBoxIrisDnn(const ofPixels & src, int downscale, int srcW, int srcH,
+		RawDetection & out);
+	/// Haar-free DNN detector (mode 4): runs the iris ONNX model on a single
+	/// centered ROI of the full-resolution frame (size = parameters.irisRoiScale
+	/// of the frame). The ROI itself is reported as the eye box (there is no
+	/// Haar eye-opening estimate), so gaze is normalized against the search
+	/// region. Reports no detection when the model is unavailable.
+	bool detectIrisDnn(const ofPixels & src, int srcW, int srcH, RawDetection & out);
+	/// Tracked DNN detector (mode 5): Haar (via detectEyeBoxIrisDnn) only
+	/// (re)acquires the eye; once locked, crops a stable ROI around the eye and
+	/// runs the model there every frame, following the iris without touching
+	/// Haar. Falls back to detectEyeBoxIris() if the model is unavailable.
+	bool detectIrisTracked(const ofPixels & src, int downscale, int srcW, int srcH,
+		RawDetection & out);
+	/// Runs the iris ONNX model on `roi` (a source-pixel rectangle) of the
+	/// full-res `srcMat`, filling `out` (center/size/radius in source px, plus a
+	/// symmetry-and-size fit quality). Returns false on any inference problem.
+	bool computeIrisInRoi(const cv::Mat & srcMat, const ofRectangle & roi,
+		IrisCandidate & out);
+	/// Lazily loads the iris ONNX model named by parameters.irisDnnModel.
+	/// Returns true once the net is ready; false (with a one-shot warning) when
+	/// the file is missing or fails to parse. Runs on the detection worker.
+	bool ensureIrisNet();
 	/// Iris candidate finder shared by the iris and combined detectors. Runs on
 	/// `gray` (a full or ROI detection image); `offX`/`offY` is the ROI origin in
 	/// detection px. Emits candidates in *source* pixels. Clears `out` first.
@@ -431,9 +392,17 @@ private:
 	Parameters parameters;
 	Result result;
 
+	// Frame acquisition. Exactly one source is *active* (`source`); which one
+	// is decided once at setup by config.playbackEnabled / OMNIVISU_NO_CAMERA.
+	// On camera builds the LiveCameraSource object always exists - even in
+	// playback mode - so the grabber's parameter group keeps living in the
+	// per-eye JSON/GUI unchanged; its camera is simply never opened then.
 #if !defined(OMNIVISU_NO_CAMERA)
-	ofxIdsPeak::Grabber grabber;
+	std::unique_ptr<LiveCameraSource> liveSource;
 #endif
+	std::unique_ptr<PlaybackSource> playbackSrc; ///< Non-null only in playback mode.
+	IFrameSource * source = nullptr; ///< The active source (points at one of the above).
+
 	ofFbo targetFbo;
 	ofShader gradeShader;
 	bool gradeShaderLoaded = false;
@@ -441,11 +410,32 @@ private:
 	ofxCvColorImage cvColor;
 	ofxCvGrayscaleImage cvGray;
 	ofxCvHaarFinder eyeFinder;
+	// Second copy of the eye cascade used only by the multi-scale seeding path
+	// (collectHaarBoxesMultiScale). Kept separate from eyeFinder so the default
+	// single-scale detection is byte-for-byte unchanged.
+	cv::CascadeClassifier irisHaarCascade;
+
+	// MediaPipe-Iris ONNX model for detector mode 3. Loaded lazily on the
+	// worker thread the first time mode 3 runs, and only used there, so no
+	// synchronization is needed. `irisNetTriedPath` records the last path we
+	// attempted so the "missing/failed" warning is logged only once per path.
+	cv::dnn::Net irisNet;
+	bool irisNetReady = false;
+	std::string irisNetTriedPath;
 	ofPixels detectionPixels; ///< Worker-only scratch buffer for downsampled tracking input.
 
 	RawDetection lastRaw;
 	ofRectangle lastEyeBox;
 	bool hasLastEyeBox = false;
+
+	// Mode 5 tracker state (worker-thread only, like lastEyeBox). While
+	// irisTrackValid is set we skip Haar and crop around irisTrackEyeCenter.
+	// irisTrackEyeBox is the eye box captured at acquisition and is kept as the
+	// stable gaze-normalization reference so gaze scale matches mode 3.
+	bool irisTrackValid = false;
+	glm::vec2 irisTrackEyeCenter{0.0f, 0.0f};
+	ofRectangle irisTrackEyeBox;
+	int irisTrackMiss = 0;
 
 	int presentHitStreak = 0;
 	int presentMissStreak = 0;
@@ -488,23 +478,8 @@ private:
 	std::atomic<std::uint64_t> detectionsRun{0};
 	std::atomic<std::uint64_t> detectionsValid{0};
 
-	// Dev-only disk playback source. When `playback` is set the grabber is never
-	// opened; the prefetcher decodes `playbackFiles` (all sessions concatenated)
-	// on a background thread and commitPlaybackFrame() uploads the next ready
-	// frame into playbackPixels + playbackTexture.
+	/// True when frames come from disk (mirrors source->isPlayback()).
 	bool playback = false;
-	std::vector<std::string> playbackFiles;
-	bool playbackFrameNew = false;
-	ofPixels playbackPixels;
-	ofTexture playbackTexture;
-	// Holding slot for a decoded-but-not-yet-shown frame, so the app can wait
-	// until both eyes have one ready before committing them together.
-	ofPixels pendingPixels;
-	bool hasPending = false;
-	std::unique_ptr<FramePrefetcher> prefetcher;
-
-	// Dev-only recorder; non-null only while recording. Recreated per session.
-	std::unique_ptr<FrameRecorder> recorder;
 
 	// Dimensions (px) of the cropped frame handed to the most recent detection
 	// job, so the worker normalizes distances against the cropped frame rather

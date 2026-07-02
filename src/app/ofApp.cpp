@@ -66,7 +66,27 @@ void ofApp::setup() {
 	}};
 	const AppConfig::PlaybackConfig & pb = appConfig.getPlayback();
 	const AppConfig::RecordingConfig & rec = appConfig.getRecording();
-	playbackFps = pb.fps;
+
+	// A camera-less build always plays back from disk; otherwise the config
+	// flag decides (EyeCameraStream::setup applies the same rule per stream).
+#if defined(OMNIVISU_NO_CAMERA)
+	const bool playbackActive = true;
+#else
+	const bool playbackActive = pb.enabled;
+#endif
+	if (playbackActive) {
+		// Scan the shared timeline once for all eyes; each stream gets its own
+		// index-aligned file list below.
+		PlaybackController::Settings ps;
+		ps.folder = pb.folder;
+		ps.fps = pb.fps;
+		std::vector<std::string> eyeNames;
+		for (const auto & eye : eyes) {
+			eyeNames.push_back(eye.name);
+		}
+		playbackCtl.setup(ps, eyeNames);
+	}
+
 	for (const auto & eye : eyes) {
 		EyeCameraStream::Config cfg;
 		cfg.name = eye.name;
@@ -74,9 +94,8 @@ void ofApp::setup() {
 		cfg.fboSize = {672, 504};
 		cfg.mirrorX = true;
 		cfg.playbackEnabled = pb.enabled;
-		cfg.playbackFolder = pb.folder;
+		cfg.playbackFiles = playbackCtl.files(eye.name);
 		cfg.playbackLoop = pb.loop;
-		cfg.recordingFolder = rec.folder;
 		cfg.recordingFormat = rec.format;
 
 		auto stream = std::make_unique<EyeCameraStream>();
@@ -86,12 +105,25 @@ void ofApp::setup() {
 		streams.push_back(std::move(stream));
 	}
 
+	// Hand every eye's playback source to the transport (nullptr for live
+	// streams; the controller only activates when all eyes are playback).
+	{
+		std::vector<PlaybackSource *> playbackSources;
+		for (const auto & stream : streams) {
+			playbackSources.push_back(stream->playbackSource());
+		}
+		playbackCtl.attach(playbackSources);
+	}
+
 	guis.reserve(streams.size());
 	for (size_t i = 0; i < streams.size(); ++i) {
 		auto panel = std::make_unique<ofxPanel>();
 		panel->setup(streams[i]->getName());
 #if !defined(OMNIVISU_NO_CAMERA)
-		panel->add(streams[i]->getGrabberParameters());
+		// Camera controls only make sense while the source is the live camera.
+		if (!streams[i]->isPlayback()) {
+			panel->add(streams[i]->getGrabberParameters());
+		}
 #endif
 		panel->add(streams[i]->getTrackingParameters());
 		panel->add(streams[i]->getGradingParameters());
@@ -178,8 +210,8 @@ void ofApp::reloadConfig() {
 	mouthLoaded = mouth.load(appConfig.getMouthJson());
 
 	// Pick up a changed playback fps cap on reload (enable/folder still need a
-	// restart since the grabber/prefetcher are wired at setup).
-	playbackFps = appConfig.getPlayback().fps;
+	// restart since the frame sources are wired at setup).
+	playbackCtl.setFps(appConfig.getPlayback().fps);
 
 	// Re-apply streaming: this tears down and restarts the sender so changes to
 	// target ip/port, compression, payload size, fps cap, async readback, or the
@@ -217,57 +249,10 @@ void ofApp::layoutGuis() {
 }
 
 //--------------------------------------------------------------
-void ofApp::advancePlaybackLockstep() {
-	// Guard: do nothing unless every eye is in disk-playback mode. In live
-	// capture this returns immediately, so none of the record/playback machinery
-	// touches the original per-stream update logic.
-	if (streams.empty()) {
-		return;
-	}
-	for (const auto & stream : streams) {
-		if (!stream->isPlayback()) {
-			return;
-		}
-	}
-
-	// Optional frame-rate cap (playback.fps; 0 = uncapped). Only the *attempt*
-	// is time-gated here; the schedule is advanced solely on a successful commit
-	// below, so the effective rate is min(target fps, decode throughput) and a
-	// slow decoder never makes us silently skip ahead.
-	if (playbackFps > 0.0f && ofGetElapsedTimef() < nextPlaybackFrameTime) {
-		return;
-	}
-
-	// Lockstep advance: stage every eye's next decoded frame, then commit them
-	// together only when *all* are ready, so per-eye decode-rate differences
-	// can't desync the frame indices.
-	bool allStaged = true;
-	for (const auto & stream : streams) {
-		// Call stage on every stream (side effects), never short-circuit.
-		allStaged = stream->stagePlaybackFrame() && allStaged;
-	}
-	if (allStaged) {
-		for (const auto & stream : streams) {
-			stream->commitPlaybackFrame();
-		}
-
-		if (playbackFps > 0.0f) {
-			const float now = ofGetElapsedTimef();
-			const float interval = 1.0f / playbackFps;
-			nextPlaybackFrameTime += interval;
-			// Resync after a stall instead of bursting a catch-up sequence.
-			if (nextPlaybackFrameTime < now) {
-				nextPlaybackFrameTime = now + interval;
-			}
-		}
-	}
-}
-
-//--------------------------------------------------------------
 void ofApp::update() {
-	// Disk-playback only; a no-op (early return) for live capture, so the
-	// original camera update path below is left exactly as it was.
-	advancePlaybackLockstep();
+	// Disk-playback transport (lockstep frame advance); a no-op for live
+	// capture, so the camera update path below is left exactly as it was.
+	playbackCtl.update();
 
 	for (const auto & stream : streams) {
 		stream->update();
@@ -289,12 +274,15 @@ void ofApp::update() {
 		for (size_t i = 0; i < streams.size(); ++i) {
 			const auto r = streams[i]->getResult();
 			msg << " | [" << i << "]";
+			if (streams[i]->isPlayback()) {
+				msg << " playback";
+			}
 #if !defined(OMNIVISU_NO_CAMERA)
-			const auto & g = streams[i]->getGrabber();
-			msg << " frames=" << g.getFrameCounter()
-				<< " err=" << g.getErrorCounter();
-#else
-			msg << " playback";
+			else {
+				const auto & g = streams[i]->getGrabber();
+				msg << " frames=" << g.getFrameCounter()
+					<< " err=" << g.getErrorCounter();
+			}
 #endif
 			msg << " worker_runs=" << streams[i]->getDetectionCount()
 				<< " hits=" << streams[i]->getValidDetectionCount()
@@ -508,7 +496,19 @@ void ofApp::keyPressed(int key) {
 		}
 		reloadConfig();
 	} else if (key == ' ') {
-		toggleRecording();
+		// In playback the spacebar is the transport pause/play toggle; in live
+		// capture it keeps its original meaning (start/stop recording).
+		if (playbackCtl.active()) {
+			playbackCtl.togglePaused();
+		} else {
+			toggleRecording();
+		}
+	} else if (key == OF_KEY_RIGHT || key == OF_KEY_UP) {
+		// Step forward: one frame, or ten with Shift held.
+		playbackCtl.step(ofGetKeyPressed(OF_KEY_SHIFT) ? 10 : 1);
+	} else if (key == OF_KEY_LEFT || key == OF_KEY_DOWN) {
+		// Step backward: one frame, or ten with Shift held.
+		playbackCtl.step(ofGetKeyPressed(OF_KEY_SHIFT) ? -10 : -1);
 	}
 }
 

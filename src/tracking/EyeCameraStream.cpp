@@ -7,22 +7,9 @@
 namespace {
 constexpr float kPi = 3.14159265358979323846f;
 
-// Playback frames decoded ahead of the render thread, per eye. Bounds the
-// prefetcher's memory to ~(depth + 1) full-frame RGB buffers per eye.
-constexpr int kPlaybackPrefetchDepth = 4;
-
 float clamp01(float v) {
 	return std::max(0.0f, std::min(1.0f, v));
 }
-
-#if !defined(OMNIVISU_NO_CAMERA)
-ofxIdsPeak::DeviceSelect deviceSelectFromString(const std::string & s) {
-	if (s == "serial") return ofxIdsPeak::DeviceSelect::Serial;
-	if (s == "model") return ofxIdsPeak::DeviceSelect::Model;
-	if (s == "index") return ofxIdsPeak::DeviceSelect::Index;
-	return ofxIdsPeak::DeviceSelect::Any;
-}
-#endif
 
 float rectDistanceSq(const ofRectangle & a, const ofRectangle & b) {
 	const float ax = a.x + a.width * 0.5f;
@@ -39,7 +26,7 @@ float rectDistanceSq(const ofRectangle & a, const ofRectangle & b) {
 void EyeCameraStream::setupParameters() {
 	parameters.group.setName(config.name);
 #if !defined(OMNIVISU_NO_CAMERA)
-	parameters.group.add(grabber.parameters.group);
+	parameters.group.add(liveSource->grabber().parameters.group);
 #endif
 
 	parameters.trackingGroup.clear();
@@ -47,11 +34,17 @@ void EyeCameraStream::setupParameters() {
 	parameters.trackingGroup.add(parameters.enableEyeTracking);
 	parameters.trackingGroup.add(parameters.showDebugOverlay);
 	parameters.trackingGroup.add(parameters.detectorMode);
+	parameters.trackingGroup.add(parameters.irisDnnModel);
+	parameters.trackingGroup.add(parameters.irisRoiScale);
+	parameters.trackingGroup.add(parameters.irisTrackMargin);
+	parameters.trackingGroup.add(parameters.irisTrackMinQuality);
+	parameters.trackingGroup.add(parameters.irisTrackLostFrames);
 	parameters.trackingGroup.add(parameters.trackingDownscale);
 	parameters.trackingGroup.add(parameters.haarMinWidth);
 	parameters.trackingGroup.add(parameters.haarMinHeight);
 	parameters.trackingGroup.add(parameters.haarScale);
 	parameters.trackingGroup.add(parameters.haarNeighbors);
+	parameters.trackingGroup.add(parameters.haarMultiScale);
 	parameters.trackingGroup.add(parameters.irisExpectedRadius);
 	parameters.trackingGroup.add(parameters.irisRadiusTolerance);
 	parameters.trackingGroup.add(parameters.irisThresholdMode);
@@ -114,12 +107,21 @@ bool EyeCameraStream::setup(const Config & cfg) {
 	config = cfg;
 
 	// In a camera-less build (macOS) playback is the only possible source;
-	// otherwise honor the config flag. When playing back, the grabber is never
-	// touched so the IDS SDK / hardware is not required at all.
+	// otherwise honor the config flag. When playing back, the camera is never
+	// opened so the IDS SDK / hardware is not required at all.
 #if defined(OMNIVISU_NO_CAMERA)
 	playback = true;
 #else
 	playback = config.playbackEnabled;
+
+	// Always constructed on camera builds (even in playback mode) so the
+	// grabber's parameter group exists for the GUI/JSON; see the member note.
+	{
+		LiveCameraSource::Config liveCfg;
+		liveCfg.name = config.name;
+		liveCfg.recordingFormat = config.recordingFormat;
+		liveSource = std::make_unique<LiveCameraSource>(std::move(liveCfg));
+	}
 #endif
 
 	setupParameters();
@@ -127,9 +129,7 @@ bool EyeCameraStream::setup(const Config & cfg) {
 	bool grabberOk = true;
 #if !defined(OMNIVISU_NO_CAMERA)
 	if (!playback) {
-		// Camera publishes RGB color frames so the rendered FBO stays RGB; the
-		// detection worker desaturates internally via ofxCvGrayscaleImage.
-		grabber.applyLowLatencyPreset(ofxIdsPeak::OutputFormat::RGB);
+		liveSource->applyLowLatencyPreset();
 	}
 #endif
 
@@ -139,25 +139,27 @@ bool EyeCameraStream::setup(const Config & cfg) {
 
 #if !defined(OMNIVISU_NO_CAMERA)
 	if (!playback) {
-		// Translate the JSON "camera" block into the grabber's device selector so
-		// this eye binds to a specific physical camera (by serial/model/index).
-		const ofxIdsPeak::DeviceSelect selectMode = deviceSelectFromString(parameters.selectBy.get());
-		const std::string selectValue = parameters.selectValue.get();
-		int selectIndex = 0;
-		if (selectMode == ofxIdsPeak::DeviceSelect::Index) {
-			try {
-				selectIndex = std::stoi(selectValue);
-			} catch (const std::exception &) {
-				ofLogWarning("EyeCameraStream") << config.name
-					<< ": camera select index '" << selectValue << "' is not an integer; using 0";
-			}
-		}
-		grabber.setDeviceSelector(selectMode, selectValue, selectIndex);
-
-		grabberOk = grabber.setup();
+		// Bind this eye to a specific physical camera (JSON "camera" block).
+		liveSource->selectDevice(parameters.selectBy.get(), parameters.selectValue.get());
+		grabberOk = liveSource->open();
 		if (!grabberOk) {
 			ofLogError("EyeCameraStream") << config.name << ": failed to initialize IDS peak camera";
 		}
+	}
+#endif
+
+	// Wire the active frame source. Everything downstream reads through it.
+	if (playback) {
+		PlaybackSource::Config playCfg;
+		playCfg.files = config.playbackFiles;
+		playCfg.loop = config.playbackLoop;
+		playCfg.name = config.name;
+		playbackSrc = std::make_unique<PlaybackSource>(std::move(playCfg));
+		source = playbackSrc.get();
+	}
+#if !defined(OMNIVISU_NO_CAMERA)
+	else {
+		source = liveSource.get();
 	}
 #endif
 
@@ -179,6 +181,20 @@ bool EyeCameraStream::setup(const Config & cfg) {
 	eyeFinder.setScaleHaar(parameters.haarScale);
 	eyeFinder.setNeighbors(parameters.haarNeighbors.get());
 
+	// Second classifier for the optional multi-scale seeding path. A load
+	// failure is non-fatal: multi-scale simply falls back to finding nothing
+	// (and mode 3 then keeps using the single-scale eyeFinder path).
+	try {
+		if (!irisHaarCascade.load(ofToDataPath(config.cascadeFile, true))) {
+			ofLogWarning("EyeCameraStream")
+				<< config.name << ": multi-scale Haar cascade failed to load; "
+				<< "'haar multi scale' will be a no-op";
+		}
+	} catch (const cv::Exception & e) {
+		ofLogWarning("EyeCameraStream")
+			<< config.name << ": multi-scale Haar cascade load error: " << e.what();
+	}
+
 	cvColor.setUseTexture(false);
 	cvGray.setUseTexture(false);
 
@@ -199,15 +215,6 @@ bool EyeCameraStream::setup(const Config & cfg) {
 	filterBoxH.setup(minCutoff, beta);
 	filterIrisX.setup(minCutoff, beta);
 	filterIrisY.setup(minCutoff, beta);
-
-	if (playback) {
-		buildPlaybackList();
-		if (!playbackFiles.empty()) {
-			prefetcher = std::make_unique<FramePrefetcher>();
-			prefetcher->start(playbackFiles, config.playbackLoop,
-				kPlaybackPrefetchDepth, config.name);
-		}
-	}
 
 	workerLastFrameTime = ofGetElapsedTimef();
 	lastFollowTime = workerLastFrameTime;
@@ -344,15 +351,15 @@ bool EyeCameraStream::loadParameters() {
 	// crash. Bracket the write so the camera parameters are applied once, safely.
 	// During initial setup the grabber is not yet initialized, so this is a no-op.
 #if !defined(OMNIVISU_NO_CAMERA)
-	const bool live = grabber.isInitialized();
+	const bool live = liveSource->grabber().isInitialized();
 	if (live) {
-		grabber.beginParameterBatch();
+		liveSource->grabber().beginParameterBatch();
 	}
 #endif
 	ofDeserialize(json, parameters.group);
 #if !defined(OMNIVISU_NO_CAMERA)
 	if (live) {
-		grabber.endParameterBatch();
+		liveSource->grabber().endParameterBatch();
 	}
 #endif
 	ofLogNotice("EyeCameraStream") << config.name << ": params loaded from " << path;
@@ -374,13 +381,14 @@ bool EyeCameraStream::saveParameters() const {
 
 //--------------------------------------------------------------
 EyeCameraStream::~EyeCameraStream() {
-	stopRecording();
-	prefetcher.reset();
+	// Stop the detection worker first: it may read source->pixels(), so the
+	// frame sources (members, destroyed after this body) must outlive it.
 	frameJobs.close();
 	if (isThreadRunning()) {
 		stopThread();
 		waitForThread(false);
 	}
+	stopRecording();
 }
 
 //--------------------------------------------------------------
@@ -511,6 +519,15 @@ bool EyeCameraStream::detectEye(const ofPixels & pixels, RawDetection & out) {
 	}
 	if (mode == 2) {
 		return detectEyeBoxIris(downscale, srcW, srcH, out);
+	}
+	if (mode == 3) {
+		return detectEyeBoxIrisDnn(pixels, downscale, srcW, srcH, out);
+	}
+	if (mode == 4) {
+		return detectIrisDnn(pixels, srcW, srcH, out);
+	}
+	if (mode == 5) {
+		return detectIrisTracked(pixels, downscale, srcW, srcH, out);
 	}
 	return detectIris(downscale, out);
 }
@@ -867,6 +884,515 @@ bool EyeCameraStream::detectEyeBoxIris(int downscale, int srcW, int srcH, RawDet
 }
 
 //--------------------------------------------------------------
+bool EyeCameraStream::ensureIrisNet() {
+	if (irisNetReady) {
+		return true;
+	}
+	const std::string rel = parameters.irisDnnModel.get();
+	if (rel.empty()) {
+		return false;
+	}
+	const std::string path = ofToDataPath(rel, true);
+	// A given path is only attempted once: on success irisNetReady stays true;
+	// on any failure irisNetTriedPath is set so we don't re-probe the disk or
+	// re-parse a broken model on every frame. Editing the path in the JSON and
+	// restarting (or clearing the field) is the way to retry.
+	if (irisNetTriedPath == path) {
+		return false;
+	}
+
+	if (!ofFile::doesFileExist(path)) {
+		irisNetTriedPath = path;
+		ofLogWarning("EyeCameraStream")
+			<< config.name << ": iris DNN model not found: " << path
+			<< " (mode 3 falls back to the classical iris detector)";
+		return false;
+	}
+	try {
+		irisNet = cv::dnn::readNetFromONNX(path);
+		irisNet.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+		irisNet.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+	} catch (const cv::Exception & e) {
+		irisNetTriedPath = path;
+		ofLogError("EyeCameraStream")
+			<< config.name << ": failed to load iris DNN model " << path
+			<< ": " << e.what() << " (falling back to the classical iris detector)";
+		return false;
+	}
+	if (irisNet.empty()) {
+		irisNetTriedPath = path;
+		return false;
+	}
+	irisNetReady = true;
+	ofLogNotice("EyeCameraStream") << config.name << ": loaded iris DNN model " << path;
+	return true;
+}
+
+//--------------------------------------------------------------
+void EyeCameraStream::collectHaarBoxesMultiScale(const cv::Mat & graySrc,
+	int srcW, int srcH, std::vector<ofRectangle> & boxes) {
+	if (irisHaarCascade.empty() || graySrc.empty()) {
+		return;
+	}
+	const int baseD = std::max(1, parameters.trackingDownscale.get());
+	// A spread of resolutions around the configured downscale. Each factor
+	// resamples the eye differently, so if one alignment misses the cascade the
+	// others still catch it. Kept small (<=5 passes) for speed.
+	static const float kMults[] = { 0.7f, 0.85f, 1.0f, 1.2f, 1.45f };
+	std::vector<int> factors;
+	for (float m : kMults) {
+		const int f = std::max(1, std::min(16, static_cast<int>(std::lround(baseD * m))));
+		if (std::find(factors.begin(), factors.end(), f) == factors.end()) {
+			factors.push_back(f);
+		}
+	}
+	std::vector<cv::Rect> hits;
+	cv::Mat small;
+	for (int f : factors) {
+		const int dw = std::max(1, srcW / f);
+		const int dh = std::max(1, srcH / f);
+		cv::resize(graySrc, small, cv::Size(dw, dh), 0, 0, cv::INTER_AREA);
+		cv::equalizeHist(small, small); // match ofxCvHaarFinder's preprocessing.
+		const int minW = std::max(1, parameters.haarMinWidth.get() / f);
+		const int minH = std::max(1, parameters.haarMinHeight.get() / f);
+		hits.clear();
+		irisHaarCascade.detectMultiScale(small, hits, parameters.haarScale.get(),
+			parameters.haarNeighbors.get(), cv::CASCADE_DO_CANNY_PRUNING,
+			cv::Size(minW, minH));
+		const float sf = static_cast<float>(f);
+		for (const auto & r : hits) {
+			boxes.emplace_back(r.x * sf, r.y * sf, r.width * sf, r.height * sf);
+		}
+	}
+}
+
+//--------------------------------------------------------------
+bool EyeCameraStream::detectEyeBoxIrisDnn(const ofPixels & src, int downscale,
+	int srcW, int srcH, RawDetection & out) {
+	// Model unavailable -> transparently behave exactly like mode 2. This is the
+	// safety net that makes switching to mode 3 free of risk.
+	if (!ensureIrisNet()) {
+		return detectEyeBoxIris(downscale, srcW, srcH, out);
+	}
+
+	// The iris model expects an RGB (or gray) eye patch. Wrap the full-res source
+	// so crops stay sharp instead of using the downscaled detection image.
+	const int ch = static_cast<int>(src.getNumChannels());
+	if (src.getData() == nullptr || (ch != 3 && ch != 1)) {
+		return detectEyeBoxIris(downscale, srcW, srcH, out);
+	}
+	const int cvType = (ch == 3) ? CV_8UC3 : CV_8UC1;
+	cv::Mat srcMat(srcH, srcW, cvType, const_cast<unsigned char *>(src.getData()));
+
+	// 1. Haar gives candidate eye-opening boxes in SOURCE px. Either the single
+	// base-resolution pass (default, identical to mode 2's seeding) or, when
+	// "haar multi scale" is on, several resolutions merged so a single Haar
+	// scale-cliff no longer causes a dropout.
+	std::vector<ofRectangle> haarBoxes;
+	if (parameters.haarMultiScale.get()) {
+		cv::Mat graySrc;
+		if (ch == 3) {
+			cv::cvtColor(srcMat, graySrc, cv::COLOR_RGB2GRAY);
+		} else {
+			graySrc = srcMat;
+		}
+		collectHaarBoxesMultiScale(graySrc, srcW, srcH, haarBoxes);
+	} else {
+		eyeFinder.setScaleHaar(parameters.haarScale);
+		eyeFinder.setNeighbors(parameters.haarNeighbors);
+		const int minW = std::max(1, parameters.haarMinWidth.get() / downscale);
+		const int minH = std::max(1, parameters.haarMinHeight.get() / downscale);
+		const int n = eyeFinder.findHaarObjects(cvGray, minW, minH);
+		if (n > 0) {
+			const float s = static_cast<float>(downscale);
+			for (const auto & blob : eyeFinder.blobs) {
+				haarBoxes.emplace_back(blob.boundingRect.x * s, blob.boundingRect.y * s,
+					blob.boundingRect.width * s, blob.boundingRect.height * s);
+			}
+		}
+	}
+	if (haarBoxes.empty()) {
+		return false;
+	}
+
+	const ofRectangle frame(0, 0, srcW, srcH);
+	const float frameDiagSq = frame.width * frame.width + frame.height * frame.height;
+	const float expected = std::max(1.0f, static_cast<float>(parameters.irisExpectedRadius.get()));
+
+	// 2. Run the iris model on the RGB crop of each box; boxes without a
+	// plausible iris are discarded (false-positive rejection, like mode 2).
+	bool found = false;
+	float bestScore = -std::numeric_limits<float>::max();
+	RawDetection bestOut;
+	std::vector<ofRectangle> allBoxes;  // debug: every Haar box considered.
+	std::vector<IrisCandidate> allIris; // debug: the model's iris per box.
+	for (const auto & rawBox : haarBoxes) {
+		// Eye box in source px, clamped to the frame.
+		float bx = std::max(0.0f, rawBox.x);
+		float by = std::max(0.0f, rawBox.y);
+		float bw = std::min(static_cast<float>(srcW) - bx, rawBox.width);
+		float bh = std::min(static_cast<float>(srcH) - by, rawBox.height);
+		if (bw < 8.0f || bh < 8.0f) {
+			continue;
+		}
+		const ofRectangle eyeBox(bx, by, bw, bh);
+		const glm::vec2 boxCenter(bx + bw * 0.5f, by + bh * 0.5f);
+		allBoxes.push_back(eyeBox);
+
+		// blobFromImage: scale to [0,1], resize to 64x64, keep RGB order (our
+		// source is already RGB, so swapRB stays false).
+		const cv::Mat roi = srcMat(cv::Rect(static_cast<int>(bx), static_cast<int>(by),
+			static_cast<int>(bw), static_cast<int>(bh)));
+		cv::Mat inBlob = cv::dnn::blobFromImage(roi, 1.0 / 255.0, cv::Size(64, 64),
+			cv::Scalar(), /*swapRB=*/false, /*crop=*/false);
+		irisNet.setInput(inBlob, "input_1");
+		cv::Mat irisOut;
+		try {
+			irisOut = irisNet.forward("output_iris");
+		} catch (const cv::Exception & e) {
+			ofLogWarning("EyeCameraStream") << config.name
+				<< ": iris DNN forward failed: " << e.what();
+			continue;
+		}
+		if (irisOut.total() < 15) {
+			continue;
+		}
+		// output_iris = 5 landmarks (x,y,z) in 64x64 patch px. Index 0 is the
+		// iris center; 1..4 are boundary points.
+		const float * v = irisOut.ptr<float>(0);
+		const float cxPatch = v[0];
+		const float cyPatch = v[1];
+		float dSum = 0.0f;
+		float dMin = std::numeric_limits<float>::max();
+		float dMax = 0.0f;
+		for (int k = 1; k < 5; ++k) {
+			const float dx = v[k * 3 + 0] - cxPatch;
+			const float dy = v[k * 3 + 1] - cyPatch;
+			const float d = std::sqrt(dx * dx + dy * dy);
+			dSum += d;
+			dMin = std::min(dMin, d);
+			dMax = std::max(dMax, d);
+		}
+		const float rPatch = dSum * 0.25f;
+
+		// Map patch (64x64) coordinates back to source px.
+		const float sx = bw / 64.0f;
+		const float sy = bh / 64.0f;
+		const glm::vec2 irisCenter(bx + cxPatch * sx, by + cyPatch * sy);
+		const float irisRadius = rPatch * 0.5f * (sx + sy);
+		const glm::vec2 irisSize(rPatch * 2.0f * sx, rPatch * 2.0f * sy);
+
+		// Quality without a classical ellipse fit: how circular the 4 boundary
+		// points sit around the center (symmetry) and how close the radius is to
+		// the expected iris radius. Reuses the existing fit-quality gate.
+		const float symmetry = (dMax > 0.0f) ? clamp01(dMin / dMax) : 0.0f;
+		const float sizeScore = clamp01(1.0f - std::abs(irisRadius - expected)
+			/ std::max(1.0f, expected));
+		const float fitQuality = clamp01(0.6f * symmetry + 0.4f * sizeScore);
+
+		IrisCandidate cand;
+		cand.center = irisCenter;
+		cand.size = irisSize;
+		cand.angleDeg = 0.0f;
+		cand.radius = irisRadius;
+		cand.fitQuality = fitQuality;
+		cand.darkness = symmetry; // reuse the "darkness" slot for the debug view.
+		cand.box = ofRectangle(irisCenter.x - irisRadius, irisCenter.y - irisRadius,
+			irisRadius * 2.0f, irisRadius * 2.0f);
+		allIris.push_back(cand);
+
+		if (fitQuality < parameters.irisMinFitQuality.get()) {
+			continue; // no plausible iris in this box -> reject the box.
+		}
+
+		// 3. Score the (box, iris) pair: iris confidence + temporal proximity,
+		// with the preferred side as a dominant preference (mirrors mode 2).
+		float temporalScore = 0.0f;
+		if (hasLastEyeBox) {
+			const float distNorm = rectDistanceSq(eyeBox, lastEyeBox) / std::max(1.0f, frameDiagSq);
+			temporalScore = 1.0f - clamp01(distNorm * 4.0f);
+		}
+		const float sidePenalty = onPreferredSide(boxCenter.x, frame.width) ? 0.0f : -10.0f;
+		const float score = fitQuality * 0.5f
+			+ temporalScore * 0.3f
+			+ sizeScore * 0.2f
+			+ sidePenalty;
+
+		if (score > bestScore) {
+			bestScore = score;
+			bestOut = {};
+			bestOut.eyeBox = eyeBox;
+			bestOut.eyeCenter = boxCenter;
+			bestOut.irisCenter = irisCenter;
+			bestOut.irisSize = irisSize;
+			bestOut.irisAngleDeg = 0.0f;
+			bestOut.irisRadiusPx = irisRadius;
+			bestOut.fitQuality = fitQuality;
+			bestOut.darkness = symmetry;
+			bestOut.confidence = fitQuality;
+			bestOut.valid = true;
+			found = true;
+		}
+	}
+
+	// Publish candidate lists for the debug overlay even when nothing survived.
+	if (!found) {
+		out.candidateBoxes = std::move(allBoxes);
+		out.candidateIris = std::move(allIris);
+		return false;
+	}
+
+	out = bestOut;
+	out.candidateBoxes = std::move(allBoxes);
+	out.candidateIris = std::move(allIris);
+	lastEyeBox = out.eyeBox;
+	hasLastEyeBox = true;
+	return true;
+}
+
+//--------------------------------------------------------------
+bool EyeCameraStream::detectIrisDnn(const ofPixels & src, int srcW, int srcH,
+	RawDetection & out) {
+	// No Haar here: this mode exists precisely to test the iris model when the
+	// cascade is the thing failing. If the model is missing we report nothing
+	// (rather than silently doing something else) so the test stays honest.
+	if (!ensureIrisNet()) {
+		return false;
+	}
+	const int ch = static_cast<int>(src.getNumChannels());
+	if (src.getData() == nullptr || (ch != 3 && ch != 1)) {
+		return false;
+	}
+	const int cvType = (ch == 3) ? CV_8UC3 : CV_8UC1;
+	cv::Mat srcMat(srcH, srcW, cvType, const_cast<unsigned char *>(src.getData()));
+
+	// Search region: a centered rectangle covering irisRoiScale of the frame.
+	const float scale = std::max(0.05f, std::min(1.0f, parameters.irisRoiScale.get()));
+	float rw = std::max(8.0f, static_cast<float>(srcW) * scale);
+	float rh = std::max(8.0f, static_cast<float>(srcH) * scale);
+	float rx = std::max(0.0f, (static_cast<float>(srcW) - rw) * 0.5f);
+	float ry = std::max(0.0f, (static_cast<float>(srcH) - rh) * 0.5f);
+	rw = std::min(rw, static_cast<float>(srcW) - rx);
+	rh = std::min(rh, static_cast<float>(srcH) - ry);
+	const ofRectangle eyeBox(rx, ry, rw, rh);
+	const glm::vec2 boxCenter(rx + rw * 0.5f, ry + rh * 0.5f);
+
+	const cv::Mat roi = srcMat(cv::Rect(static_cast<int>(rx), static_cast<int>(ry),
+		static_cast<int>(rw), static_cast<int>(rh)));
+	cv::Mat inBlob = cv::dnn::blobFromImage(roi, 1.0 / 255.0, cv::Size(64, 64),
+		cv::Scalar(), /*swapRB=*/false, /*crop=*/false);
+	irisNet.setInput(inBlob, "input_1");
+	cv::Mat irisOut;
+	try {
+		irisOut = irisNet.forward("output_iris");
+	} catch (const cv::Exception & e) {
+		ofLogWarning("EyeCameraStream") << config.name
+			<< ": iris DNN forward failed: " << e.what();
+		return false;
+	}
+	if (irisOut.total() < 15) {
+		return false;
+	}
+
+	// output_iris: 5 landmarks (x,y,z) in 64x64 patch px; index 0 = center.
+	const float * v = irisOut.ptr<float>(0);
+	const float cxPatch = v[0];
+	const float cyPatch = v[1];
+	float dSum = 0.0f;
+	float dMin = std::numeric_limits<float>::max();
+	float dMax = 0.0f;
+	for (int k = 1; k < 5; ++k) {
+		const float dx = v[k * 3 + 0] - cxPatch;
+		const float dy = v[k * 3 + 1] - cyPatch;
+		const float d = std::sqrt(dx * dx + dy * dy);
+		dSum += d;
+		dMin = std::min(dMin, d);
+		dMax = std::max(dMax, d);
+	}
+	const float rPatch = dSum * 0.25f;
+
+	const float sx = rw / 64.0f;
+	const float sy = rh / 64.0f;
+	const glm::vec2 irisCenter(rx + cxPatch * sx, ry + cyPatch * sy);
+	const float irisRadius = rPatch * 0.5f * (sx + sy);
+	const glm::vec2 irisSize(rPatch * 2.0f * sx, rPatch * 2.0f * sy);
+
+	const float expected = std::max(1.0f, static_cast<float>(parameters.irisExpectedRadius.get()));
+	const float symmetry = (dMax > 0.0f) ? clamp01(dMin / dMax) : 0.0f;
+	const float sizeScore = clamp01(1.0f - std::abs(irisRadius - expected)
+		/ std::max(1.0f, expected));
+	const float fitQuality = clamp01(0.6f * symmetry + 0.4f * sizeScore);
+
+	IrisCandidate cand;
+	cand.center = irisCenter;
+	cand.size = irisSize;
+	cand.angleDeg = 0.0f;
+	cand.radius = irisRadius;
+	cand.fitQuality = fitQuality;
+	cand.darkness = symmetry;
+	cand.box = ofRectangle(irisCenter.x - irisRadius, irisCenter.y - irisRadius,
+		irisRadius * 2.0f, irisRadius * 2.0f);
+	// Debug overlay: show the search ROI and the single detected iris.
+	out.candidateBoxes = {eyeBox};
+	out.candidateIris = {cand};
+
+	if (fitQuality < parameters.irisMinFitQuality.get()) {
+		return false; // implausible iris -> treat as a miss.
+	}
+
+	out.eyeBox = eyeBox;
+	out.eyeCenter = boxCenter;
+	out.irisCenter = irisCenter;
+	out.irisSize = irisSize;
+	out.irisAngleDeg = 0.0f;
+	out.irisRadiusPx = irisRadius;
+	out.fitQuality = fitQuality;
+	out.darkness = symmetry;
+	out.confidence = fitQuality;
+	out.valid = true;
+
+	lastEyeBox = eyeBox;
+	hasLastEyeBox = true;
+	return true;
+}
+
+//--------------------------------------------------------------
+bool EyeCameraStream::computeIrisInRoi(const cv::Mat & srcMat, const ofRectangle & roi,
+	IrisCandidate & out) {
+	const int rx = static_cast<int>(roi.x);
+	const int ry = static_cast<int>(roi.y);
+	const int rw = static_cast<int>(roi.width);
+	const int rh = static_cast<int>(roi.height);
+	if (rw < 8 || rh < 8 || rx < 0 || ry < 0
+		|| rx + rw > srcMat.cols || ry + rh > srcMat.rows) {
+		return false;
+	}
+	const cv::Mat r = srcMat(cv::Rect(rx, ry, rw, rh));
+	cv::Mat inBlob = cv::dnn::blobFromImage(r, 1.0 / 255.0, cv::Size(64, 64),
+		cv::Scalar(), /*swapRB=*/false, /*crop=*/false);
+	irisNet.setInput(inBlob, "input_1");
+	cv::Mat irisOut;
+	try {
+		irisOut = irisNet.forward("output_iris");
+	} catch (const cv::Exception & e) {
+		ofLogWarning("EyeCameraStream") << config.name
+			<< ": iris DNN forward failed: " << e.what();
+		return false;
+	}
+	if (irisOut.total() < 15) {
+		return false;
+	}
+
+	// output_iris: 5 landmarks (x,y,z) in 64x64 patch px; index 0 = center.
+	const float * v = irisOut.ptr<float>(0);
+	const float cxPatch = v[0];
+	const float cyPatch = v[1];
+	float dSum = 0.0f;
+	float dMin = std::numeric_limits<float>::max();
+	float dMax = 0.0f;
+	for (int k = 1; k < 5; ++k) {
+		const float dx = v[k * 3 + 0] - cxPatch;
+		const float dy = v[k * 3 + 1] - cyPatch;
+		const float d = std::sqrt(dx * dx + dy * dy);
+		dSum += d;
+		dMin = std::min(dMin, d);
+		dMax = std::max(dMax, d);
+	}
+	const float rPatch = dSum * 0.25f;
+
+	const float sx = static_cast<float>(rw) / 64.0f;
+	const float sy = static_cast<float>(rh) / 64.0f;
+	const float expected = std::max(1.0f, static_cast<float>(parameters.irisExpectedRadius.get()));
+	out.center = {static_cast<float>(rx) + cxPatch * sx, static_cast<float>(ry) + cyPatch * sy};
+	out.radius = rPatch * 0.5f * (sx + sy);
+	out.size = {rPatch * 2.0f * sx, rPatch * 2.0f * sy};
+	out.angleDeg = 0.0f;
+	const float symmetry = (dMax > 0.0f) ? clamp01(dMin / dMax) : 0.0f;
+	const float sizeScore = clamp01(1.0f - std::abs(out.radius - expected) / std::max(1.0f, expected));
+	out.fitQuality = clamp01(0.6f * symmetry + 0.4f * sizeScore);
+	out.darkness = symmetry;
+	out.box = ofRectangle(out.center.x - out.radius, out.center.y - out.radius,
+		out.radius * 2.0f, out.radius * 2.0f);
+	return true;
+}
+
+//--------------------------------------------------------------
+bool EyeCameraStream::detectIrisTracked(const ofPixels & src, int downscale,
+	int srcW, int srcH, RawDetection & out) {
+	if (!ensureIrisNet()) {
+		return detectEyeBoxIris(downscale, srcW, srcH, out); // safe fallback.
+	}
+	const int ch = static_cast<int>(src.getNumChannels());
+	if (src.getData() == nullptr || (ch != 3 && ch != 1)) {
+		return detectEyeBoxIris(downscale, srcW, srcH, out);
+	}
+	const int cvType = (ch == 3) ? CV_8UC3 : CV_8UC1;
+	cv::Mat srcMat(srcH, srcW, cvType, const_cast<unsigned char *>(src.getData()));
+
+	// --- Tracking branch: skip Haar entirely, follow the eye ------------------
+	if (irisTrackValid) {
+		// Square ROI centered on the stable eye reference, sized from the
+		// seed eye box so the iris stays inside across gaze extremes.
+		const float margin = std::max(1.0f, parameters.irisTrackMargin.get());
+		float side = std::max(irisTrackEyeBox.width, irisTrackEyeBox.height) * margin;
+		side = std::min(side, static_cast<float>(std::min(srcW, srcH)));
+		side = std::max(16.0f, side);
+		float rx = irisTrackEyeCenter.x - side * 0.5f;
+		float ry = irisTrackEyeCenter.y - side * 0.5f;
+		rx = std::max(0.0f, std::min(rx, static_cast<float>(srcW) - side));
+		ry = std::max(0.0f, std::min(ry, static_cast<float>(srcH) - side));
+		const ofRectangle roi(rx, ry, side, side);
+
+		// Eye box for gaze/follow: the seed box recentered on the stable
+		// reference, so gaze scale matches mode 3.
+		const ofRectangle eyeBox(
+			irisTrackEyeCenter.x - irisTrackEyeBox.width * 0.5f,
+			irisTrackEyeCenter.y - irisTrackEyeBox.height * 0.5f,
+			irisTrackEyeBox.width, irisTrackEyeBox.height);
+
+		IrisCandidate cand;
+		const bool got = computeIrisInRoi(srcMat, roi, cand);
+		out.candidateBoxes = {eyeBox, roi};
+		if (got) {
+			out.candidateIris = {cand};
+		}
+
+		if (got && cand.fitQuality >= parameters.irisTrackMinQuality.get()) {
+			irisTrackMiss = 0;
+			out.eyeBox = eyeBox;
+			out.eyeCenter = irisTrackEyeCenter;
+			out.irisCenter = cand.center;
+			out.irisSize = cand.size;
+			out.irisAngleDeg = 0.0f;
+			out.irisRadiusPx = cand.radius;
+			out.fitQuality = cand.fitQuality;
+			out.darkness = cand.darkness;
+			out.confidence = cand.fitQuality;
+			out.valid = true;
+			lastEyeBox = eyeBox;
+			hasLastEyeBox = true;
+			return true;
+		}
+
+		// Tracking miss: tolerate a few, then drop back to Haar re-acquisition.
+		if (++irisTrackMiss >= parameters.irisTrackLostFrames.get()) {
+			irisTrackValid = false;
+		}
+		return false;
+	}
+
+	// --- Acquisition branch: use the mode-3 Haar+DNN machinery, then latch ----
+	const bool ok = detectEyeBoxIrisDnn(src, downscale, srcW, srcH, out);
+	if (ok) {
+		irisTrackValid = true;
+		irisTrackEyeCenter = out.eyeCenter;
+		irisTrackEyeBox = out.eyeBox;
+		irisTrackMiss = 0;
+	}
+	return ok;
+}
+
+//--------------------------------------------------------------
 EyeCameraStream::IrisCandidate EyeCameraStream::pickBestIris(
 	const std::vector<IrisCandidate> & cands) const {
 	if (cands.empty()) {
@@ -968,6 +1494,9 @@ void EyeCameraStream::applySmoothing(const RawDetection & raw, float dt) {
 		// detection picks the strongest blob by area only. Prevents a single
 		// false positive (chin, mouth, etc.) from sticking via temporal score.
 		hasLastEyeBox = false;
+		// Also drop the mode-5 tracker so a prolonged loss forces a fresh Haar
+		// re-acquisition rather than resuming from a stale eye reference.
+		irisTrackValid = false;
 	}
 
 	result.present = presentSmoothed;
@@ -1191,6 +1720,7 @@ void EyeCameraStream::threadedFunction() {
 			presentHitStreak = 0;
 			presentMissStreak = 0;
 			hasLastEyeBox = false;
+			irisTrackValid = false;
 			std::lock_guard<std::mutex> lk(stateMutex);
 			resetWorkerStateLocked();
 			continue;
@@ -1228,26 +1758,17 @@ void EyeCameraStream::threadedFunction() {
 
 //--------------------------------------------------------------
 void EyeCameraStream::update() {
-#if !defined(OMNIVISU_NO_CAMERA)
-	// In playback the next frame is staged/committed by the app (lockstep across
-	// eyes) *before* update() runs; live capture polls the grabber here.
-	if (!playback) {
-		grabber.update();
+	// In playback the next frame is staged/committed by the PlaybackController
+	// (lockstep across eyes) *before* update() runs, so PlaybackSource::update()
+	// is a no-op; live capture polls the grabber (and feeds the recorder) here.
+	if (source) {
+		source->update();
 	}
-#endif
 
 	if (!sourceFrameNew()) {
 		renderTargetFbo();
 		return;
 	}
-
-	// Dev-only: capture the raw (uncropped, ungraded) frame before anything
-	// downstream touches it, so playback reproduces the live pipeline exactly.
-#if !defined(OMNIVISU_NO_CAMERA)
-	if (!playback && recorder) {
-		recorder->enqueue(grabber.getPixels());
-	}
-#endif
 
 	if (!parameters.enableEyeTracking) {
 		std::lock_guard<std::mutex> lk(stateMutex);
@@ -1288,146 +1809,21 @@ void EyeCameraStream::update() {
 
 //--------------------------------------------------------------
 const ofPixels & EyeCameraStream::sourcePixels() const {
-#if defined(OMNIVISU_NO_CAMERA)
-	return playbackPixels;
-#else
-	return playback ? playbackPixels : grabber.getPixels();
-#endif
+	// Null-safe: setup() can bail before wiring a source, but update()/draw()
+	// keep being called on the broken stream.
+	static const ofPixels kNoPixels;
+	return source ? source->pixels() : kNoPixels;
 }
 
 //--------------------------------------------------------------
 const ofTexture & EyeCameraStream::sourceTexture() const {
-#if defined(OMNIVISU_NO_CAMERA)
-	return playbackTexture;
-#else
-	return playback ? playbackTexture : grabber.getTexture();
-#endif
+	static const ofTexture kNoTexture;
+	return source ? source->texture() : kNoTexture;
 }
 
 //--------------------------------------------------------------
 bool EyeCameraStream::sourceFrameNew() const {
-#if defined(OMNIVISU_NO_CAMERA)
-	return playbackFrameNew;
-#else
-	return playback ? playbackFrameNew : grabber.isFrameNew();
-#endif
-}
-
-//--------------------------------------------------------------
-void EyeCameraStream::buildPlaybackList() {
-	playbackFiles.clear();
-
-	const std::string root = ofToDataPath(config.playbackFolder, true);
-	ofDirectory rootDir(root);
-	if (!rootDir.exists()) {
-		ofLogWarning("EyeCameraStream") << config.name
-			<< ": playback folder not found: " << root;
-		return;
-	}
-
-	// Sessions are the timestamped subfolders; sorted lexically == chronological
-	// with the YYMMDD-HHMMSS naming.
-	rootDir.listDir();
-	std::vector<std::string> sessions;
-	for (std::size_t i = 0; i < rootDir.size(); ++i) {
-		if (rootDir.getFile(i).isDirectory()) {
-			sessions.push_back(rootDir.getPath(i));
-		}
-	}
-	std::sort(sessions.begin(), sessions.end());
-
-	// Sorted list of image files inside one eye subfolder.
-	auto listEyeFrames = [](const std::string & dir) {
-		std::vector<std::string> files;
-		ofDirectory d(dir);
-		if (!d.exists()) {
-			return files;
-		}
-		d.allowExt("jpg");
-		d.allowExt("jpeg");
-		d.allowExt("png");
-		d.listDir();
-		d.sort();
-		for (std::size_t i = 0; i < d.size(); ++i) {
-			files.push_back(d.getPath(i));
-		}
-		return files;
-	};
-
-	// Within each session, concatenate this eye's ordered frame files. The two
-	// cameras are unsynchronized and record slightly different frame counts, so
-	// clamp each session to the shortest eye_* sequence in it. That keeps frame
-	// index N of the left eye paired with index N of the right eye during
-	// playback. Recordings on disk are left untouched; the surplus tail frames
-	// of the longer eye are simply not queued.
-	const std::string eyeSub = "eye_" + config.name;
-	for (const auto & session : sessions) {
-		const std::vector<std::string> mine = listEyeFrames(ofFilePath::join(session, eyeSub));
-		if (mine.empty()) {
-			continue;
-		}
-
-		std::size_t frameCount = mine.size();
-		ofDirectory sessionDir(session);
-		sessionDir.listDir();
-		for (std::size_t i = 0; i < sessionDir.size(); ++i) {
-			if (!sessionDir.getFile(i).isDirectory()) {
-				continue;
-			}
-			const std::string name = sessionDir.getName(i);
-			if (name == eyeSub || name.rfind("eye_", 0) != 0) {
-				continue; // only other eye_* siblings.
-			}
-			const std::size_t siblingCount = listEyeFrames(sessionDir.getPath(i)).size();
-			if (siblingCount > 0) {
-				frameCount = std::min(frameCount, siblingCount);
-			}
-		}
-
-		for (std::size_t i = 0; i < frameCount; ++i) {
-			playbackFiles.push_back(mine[i]);
-		}
-	}
-
-	ofLogNotice("EyeCameraStream") << config.name << ": playback loaded "
-		<< playbackFiles.size() << " frames (index-aligned) from " << sessions.size()
-		<< " session(s) in " << root;
-}
-
-//--------------------------------------------------------------
-bool EyeCameraStream::stagePlaybackFrame() {
-	// Clears the per-tick "new frame" flag and pulls the next decoded frame into
-	// the holding slot (if not already staged from an earlier tick where the
-	// other eye wasn't ready). Returns whether a frame is staged and ready.
-	playbackFrameNew = false;
-	if (!prefetcher) {
-		return false;
-	}
-	if (!hasPending) {
-		hasPending = prefetcher->tryGet(pendingPixels);
-	}
-	return hasPending;
-}
-
-void EyeCameraStream::commitPlaybackFrame() {
-	if (!hasPending) {
-		return;
-	}
-
-	// Keep the staged buffer and return the previous one to the pool so the
-	// decoder can reuse its allocation.
-	std::swap(playbackPixels, pendingPixels);
-	prefetcher->recycle(std::move(pendingPixels));
-	hasPending = false;
-
-	// Texture upload stays on the (GL) main thread, before renderTargetFbo().
-	if (!playbackTexture.isAllocated()
-		|| static_cast<int>(playbackTexture.getWidth()) != static_cast<int>(playbackPixels.getWidth())
-		|| static_cast<int>(playbackTexture.getHeight()) != static_cast<int>(playbackPixels.getHeight())) {
-		playbackTexture.allocate(playbackPixels);
-	}
-	playbackTexture.loadData(playbackPixels);
-	playbackFrameNew = true;
+	return source && source->isFrameNew();
 }
 
 //--------------------------------------------------------------
@@ -1436,21 +1832,20 @@ void EyeCameraStream::startRecording(const std::string & dir) {
 		ofLogNotice("EyeCameraStream") << config.name << ": recording ignored (playback mode)";
 		return;
 	}
-	stopRecording();
-	// dir is relative to bin/data; create it (recursively) before writing.
-	ofDirectory::createDirectory(dir, true, true);
-	recorder = std::make_unique<FrameRecorder>();
-	recorder->start(dir, config.recordingFormat);
-	ofLogNotice("EyeCameraStream") << config.name << ": recording to " << dir;
+#if !defined(OMNIVISU_NO_CAMERA)
+	liveSource->startRecording(dir);
+#else
+	(void)dir;
+#endif
 }
 
 //--------------------------------------------------------------
 void EyeCameraStream::stopRecording() {
-	if (recorder) {
-		recorder->stop();
-		recorder.reset();
-		ofLogNotice("EyeCameraStream") << config.name << ": recording stopped";
+#if !defined(OMNIVISU_NO_CAMERA)
+	if (liveSource) {
+		liveSource->stopRecording();
 	}
+#endif
 }
 
 //--------------------------------------------------------------
