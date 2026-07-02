@@ -4,6 +4,9 @@ set -e
 # Load X11 / XWayland environment for openFrameworks
 source "$HOME/of-env.sh"
 
+# Ensure the display output is flipped for omnivisu
+source "$HOME/of-flip.sh"
+
 APP_DIR="$HOME/Documents/of_v0.12.1_linux64_gcc6_release/apps/myApps/omnivisu"
 APP_BIN="$APP_DIR/bin/omnivisu"
 
