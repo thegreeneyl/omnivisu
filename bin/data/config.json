@@ -3,7 +3,7 @@
         "display_mode": "mask"
     },
     "playback": {
-        "enabled": true,
+        "enabled": false,
         "folder": "recordings",
         "loop": true,
         "fps": 30

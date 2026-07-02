@@ -46,8 +46,9 @@
             "wb_red": "2"
         },
         "tracking": {
-            "debug_show_candidates": "0",
-            "detector_mode": "2",
+            "debug_show_candidates": "1",
+            "detector_mode": "3",
+            "iris_dnn_model": "models/iris_landmark.onnx",
             "enable_eye_tracking": "1",
             "euro_beta": "0.007",
             "euro_min_cutoff": "0.5",
@@ -69,7 +70,7 @@
             "present_off_frames": "10",
             "present_on_frames": "4",
             "show_debug_overlay": "1",
-            "tracking_downscale": "4"
+            "tracking_downscale": "12"
         },
         "view": {
             "fit_to_fill": "0",
