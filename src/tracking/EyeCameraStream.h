@@ -97,6 +97,10 @@ public:
 	void drawRawDebug(float x, float y, float w, float h);
 
 	const ofFbo & getTargetFbo() const { return targetFbo; }
+	/// Presence fade [0..1] applied when rendering the cropped eye FBO: 1 =
+	/// full image, 0 = black. Set by the app from combined eye presence; only
+	/// affects the target FBO (mask/eye views + stream), never the raw view.
+	void setPresenceFade(float fade) { presenceFade = ofClamp(fade, 0.0f, 1.0f); }
 	Result getResult() const {
 		std::lock_guard<std::mutex> lk(stateMutex);
 		return result;
@@ -491,6 +495,9 @@ private:
 	// responsive (gaze source) while the box holds still.
 	OneEuroFilter filterIrisX;
 	OneEuroFilter filterIrisY;
+
+	// Presence fade applied in renderTargetFbo (main thread only).
+	float presenceFade = 1.0f;
 
 	// Eye-follow smoothing state. <0 marks an uninitialized smoothed center so
 	// the first valid detection snaps in (no lurch from origin) and subsequent

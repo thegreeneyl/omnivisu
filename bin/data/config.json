@@ -19,7 +19,9 @@
         "compression": "jpeg",
         "packet_payload_bytes": 1440,
         "fps_limit": 50,
-        "async_readback": false
+        "async_readback": false,
+        "fade_in_seconds": 0.5,
+        "fade_out_seconds": 2.0
     },
     "mask": {
         "mask_image": "260408-TGE-OMNI-FrantalView.png",

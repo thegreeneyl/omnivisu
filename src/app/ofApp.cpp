@@ -170,6 +170,8 @@ void ofApp::applyStreamingConfig(const AppConfig::StreamingConfig & sc) {
 
 	streamAsyncReadback = sc.asyncReadback;
 	streamFpsLimit = sc.fpsLimit;
+	streamFadeInSeconds = sc.fadeInSeconds;
+	streamFadeOutSeconds = sc.fadeOutSeconds;
 	if (!streamPixels.isAllocated()) {
 		streamPixels.allocate(kStreamWidth, kStreamHeight, OF_PIXELS_RGB);
 	}
@@ -253,6 +255,33 @@ void ofApp::update() {
 	// Disk-playback transport (lockstep frame advance); a no-op for live
 	// capture, so the camera update path below is left exactly as it was.
 	playbackCtl.update();
+
+	// Presence-driven fade: ramp toward 1 while at least one eye is present,
+	// toward 0 while none is. A ramp time of 0 snaps instantly. Computed and
+	// handed to the streams *before* they render their target FBOs so the
+	// fade takes effect in the same frame.
+	{
+		bool anyPresent = false;
+		for (const auto & stream : streams) {
+			if (stream->getResult().present) {
+				anyPresent = true;
+				break;
+			}
+		}
+		const float dt = static_cast<float>(ofGetLastFrameTime());
+		if (anyPresent) {
+			presenceFade = (streamFadeInSeconds > 1e-4f)
+				? std::min(1.0f, presenceFade + dt / streamFadeInSeconds)
+				: 1.0f;
+		} else {
+			presenceFade = (streamFadeOutSeconds > 1e-4f)
+				? std::max(0.0f, presenceFade - dt / streamFadeOutSeconds)
+				: 0.0f;
+		}
+		for (const auto & stream : streams) {
+			stream->setPresenceFade(presenceFade);
+		}
+	}
 
 	for (const auto & stream : streams) {
 		stream->update();
@@ -376,6 +405,14 @@ void ofApp::updateStream() {
 		return;
 	}
 
+	// Fully faded out: stop streaming (no render, no readback, no packets).
+	// Dropping the primed PBO frame ensures resume never emits a stale image.
+	// The fps-limit resync below handles the schedule gap when we come back.
+	if (presenceFade <= 0.0f) {
+		streamPboPrimed = false;
+		return;
+	}
+
 	// Decouple the expensive stream render+readback from the display rate. When
 	// capped, most display frames skip this work entirely so the window holds
 	// its full refresh rate.
@@ -407,6 +444,8 @@ void ofApp::updateStream() {
 		drawStreamCover(*streams[1],
 			ofRectangle(kStreamEyeWidth, 0.0f, kStreamEyeWidth, kStreamHeight), vpH);
 	}
+	// No fade overlay needed here: the per-eye target FBOs drawn above are
+	// already faded by EyeCameraStream::renderTargetFbo.
 	streamFbo.end();
 
 	if (streamAsyncReadback) {

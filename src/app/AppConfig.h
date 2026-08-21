@@ -17,6 +17,11 @@ public:
 		int packetPayloadBytes = 1440;    ///< UDP payload chunk size (sans header).
 		int fpsLimit = 0;                 ///< Max send rate; 0 = unlimited.
 		bool asyncReadback = true;        ///< PBO async FBO readback (+1 frame latency, recovers fps).
+		// Presence-driven fade: the stream fades in while at least one eye is
+		// present and out to black when none is; at 0 the stream stops sending
+		// entirely. 0 seconds = instant snap.
+		float fadeInSeconds = 0.5f;
+		float fadeOutSeconds = 2.0f;
 	};
 
 	/// Replay recorded image sequences instead of the live camera. When

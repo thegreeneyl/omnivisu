@@ -86,6 +86,17 @@ private:
 	int streamFpsLimit = 0;
 	float nextStreamSampleTime = 0.0f;
 
+	// Presence-driven fade [0..1]: ramps toward 1 while at least one eye is
+	// present, toward 0 while none is. Applied inside each eye's cropped
+	// target FBO (so mask view, side-by-side view, and the stream all fade
+	// together; the raw camera debug view stays live). At 0 the stream
+	// render/readback/send is skipped entirely and resumes as soon as the
+	// fade rises again. Starts at 0 so everything is dark and the stream
+	// silent until the first eye is acquired.
+	float presenceFade = 0.0f;
+	float streamFadeInSeconds = 0.5f;
+	float streamFadeOutSeconds = 2.0f;
+
 	// Rolling CPU cost of updateStream() for the per-second diagnostic log.
 	double streamCpuUsSum = 0.0;
 	int streamCpuSamples = 0;

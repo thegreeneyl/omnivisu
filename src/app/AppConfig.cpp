@@ -37,6 +37,8 @@ bool AppConfig::load(const std::string & path) {
 		streaming.packetPayloadBytes = s.value("packet_payload_bytes", streaming.packetPayloadBytes);
 		streaming.fpsLimit = s.value("fps_limit", streaming.fpsLimit);
 		streaming.asyncReadback = s.value("async_readback", streaming.asyncReadback);
+		streaming.fadeInSeconds = s.value("fade_in_seconds", streaming.fadeInSeconds);
+		streaming.fadeOutSeconds = s.value("fade_out_seconds", streaming.fadeOutSeconds);
 	}
 
 	if (json.contains("playback")) {

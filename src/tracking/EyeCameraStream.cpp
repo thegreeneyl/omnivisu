@@ -1763,6 +1763,17 @@ void EyeCameraStream::renderTargetFbo() {
 	}
 	drawCameraIntoFbo(drawX, drawY, drawW, drawH, cropRect);
 	ofPopMatrix();
+	// Presence fade: darken the cropped eye image toward black. Applied here
+	// so every consumer of the target FBO (mask view, side-by-side view, and
+	// the UDP stream) fades together while the raw debug view stays live.
+	if (presenceFade < 1.0f) {
+		ofPushStyle();
+		ofEnableAlphaBlending();
+		ofFill();
+		ofSetColor(0, 0, 0, static_cast<int>((1.0f - presenceFade) * 255.0f));
+		ofDrawRectangle(0.0f, 0.0f, fboW, fboH);
+		ofPopStyle();
+	}
 	targetFbo.end();
 }
 

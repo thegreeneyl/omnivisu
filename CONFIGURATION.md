@@ -49,14 +49,20 @@ because they only take effect when the stream is created.
 
 ### `streaming`
 
-Reserved for upcoming eye-FBO network streaming. Parsed and stored today, but no
-network code consumes it yet.
+UDP streaming of the combined eye image (828x280, both eyes side by side) to a
+receiver. Re-applied live on config reload (`c`).
 
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `enabled` | bool | `false` | Master on/off for streaming. |
 | `target_ip` | string | `"127.0.0.1"` | Destination host. |
 | `target_port` | int | `12345` | Destination port. |
+| `compression` | string | `"none"` | `"none"` (raw RGB) or `"jpeg"`. |
+| `packet_payload_bytes` | int | `1440` | UDP payload chunk size (sans header). |
+| `fps_limit` | int | `0` | Max stream sample/send rate, decoupled from the display rate. `0` = every display frame. |
+| `async_readback` | bool | `true` | Double-buffered PBO readback: avoids the GPU pipeline stall at the cost of one frame of latency. |
+| `fade_in_seconds` | float | `0.5` | Presence fade-in: while at least one eye is PRESENT the cropped eye images (mask view, side-by-side view, and the stream — the raw camera view is unaffected) ramp from black to full over this time. `0` = instant. |
+| `fade_out_seconds` | float | `2.0` | Presence fade-out: while no eye is PRESENT the cropped eye images ramp to black over this time; at fully black the stream stops sending packets entirely and resumes as soon as an eye returns. `0` = instant. |
 
 ### `mask`
 
