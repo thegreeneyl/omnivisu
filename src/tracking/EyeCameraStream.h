@@ -70,6 +70,7 @@ public:
 		float irisAngleDeg = 0.0f;     ///< Ellipse rotation, degrees.
 		float irisRadiusPx = 0.0f;     ///< Mean radius = (irisSize.x + irisSize.y) / 4.
 		float fitQuality = 0.0f;       ///< 0..1 ellipse-fit confidence (0 for haar).
+		float sharpness = 0.0f;        ///< Eye-box variance-of-Laplacian (see RawDetection).
 
 		// Phase 2 expression signals (populated later; defaults are neutral).
 		glm::vec2 gaze = {0, 0};       ///< Normalized iris offset vs neutral.
@@ -179,6 +180,10 @@ private:
 		float irisRadiusPx = 0.0f;
 		float fitQuality = 0.0f;
 		float darkness = 0.0f; ///< Chosen iris darkness margin, 0..1 (see IrisCandidate).
+		// Variance-of-Laplacian sharpness of the eye-box ROI (resolution
+		// independent: measured on the ROI resized to a fixed patch). Only
+		// filled when the detection produced an eye box.
+		float sharpness = 0.0f;
 
 		// All candidates considered this frame, in *source* px, for the debug
 		// overlay ("show candidates"). Boxes are Haar eye boxes (modes 1/2);
@@ -286,6 +291,11 @@ private:
 		// appears just before a blink. 0 disables the size check.
 		ofParameter<float> jumpMaxSizeFrac{"jump max size frac", 0.35f, 0.0f, 2.0f};
 		ofParameter<int> jumpConfirmFrames{"jump confirm frames", 3, 1, 30};
+		// Blur gate: a detection whose eye-box variance-of-Laplacian sharpness
+		// is below this is treated as a miss (presence hysteresis + anchor
+		// hold handle it). 0 disables. Tune by watching "sharp=" in the raw
+		// debug view for typical sharp vs blurry readings.
+		ofParameter<float> minSharpness{"min sharpness", 0.0f, 0.0f, 2000.0f};
 
 		ofParameterGroup gradingGroup{"grading"};
 		ofParameter<bool> enableGrading{"enable grading", true};

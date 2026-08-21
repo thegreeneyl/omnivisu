@@ -20,6 +20,46 @@ float rectDistanceSq(const ofRectangle & a, const ofRectangle & b) {
 	const float dy = ay - by;
 	return dx * dx + dy * dy;
 }
+
+/// Variance-of-Laplacian sharpness of `boxSrc` in `frame` (full-res worker
+/// frame, RGB or gray). The ROI is resized to a fixed patch first so the
+/// metric is independent of eye-box size / camera resolution and a single
+/// min_sharpness threshold stays meaningful. Returns 0 when the ROI is
+/// unusable (degenerate box, unsupported format).
+float computeEyeBoxSharpness(const ofPixels & frame, const ofRectangle & boxSrc) {
+	const int ch = static_cast<int>(frame.getNumChannels());
+	if (frame.getData() == nullptr || (ch != 3 && ch != 1)) {
+		return 0.0f;
+	}
+	const int srcW = static_cast<int>(frame.getWidth());
+	const int srcH = static_cast<int>(frame.getHeight());
+	const int rx = std::max(0, static_cast<int>(boxSrc.x));
+	const int ry = std::max(0, static_cast<int>(boxSrc.y));
+	const int rw = std::min(srcW - rx, static_cast<int>(boxSrc.width));
+	const int rh = std::min(srcH - ry, static_cast<int>(boxSrc.height));
+	if (rw < 8 || rh < 8) {
+		return 0.0f;
+	}
+
+	const int cvType = (ch == 3) ? CV_8UC3 : CV_8UC1;
+	cv::Mat srcMat(srcH, srcW, cvType, const_cast<unsigned char *>(frame.getData()));
+	const cv::Mat roi = srcMat(cv::Rect(rx, ry, rw, rh));
+
+	cv::Mat gray;
+	if (ch == 3) {
+		cv::cvtColor(roi, gray, cv::COLOR_RGB2GRAY);
+	} else {
+		gray = roi;
+	}
+	cv::Mat patch;
+	cv::resize(gray, patch, cv::Size(96, 96), 0.0, 0.0, cv::INTER_AREA);
+
+	cv::Mat lap;
+	cv::Laplacian(patch, lap, CV_32F);
+	cv::Scalar mean, stddev;
+	cv::meanStdDev(lap, mean, stddev);
+	return static_cast<float>(stddev[0] * stddev[0]);
+}
 } // namespace
 
 //--------------------------------------------------------------
@@ -64,6 +104,7 @@ void EyeCameraStream::setupParameters() {
 	parameters.trackingGroup.add(parameters.jumpMaxPosFrac);
 	parameters.trackingGroup.add(parameters.jumpMaxSizeFrac);
 	parameters.trackingGroup.add(parameters.jumpConfirmFrames);
+	parameters.trackingGroup.add(parameters.minSharpness);
 	parameters.group.add(parameters.trackingGroup);
 
 	parameters.gradingGroup.clear();
@@ -1512,6 +1553,13 @@ void EyeCameraStream::applySmoothing(const RawDetection & raw, float dt) {
 
 	result.present = presentSmoothed;
 
+	// Publish sharpness whenever it was measured — including detections the
+	// blur gate demoted to a miss — so the overlay shows blurry readings and
+	// min_sharpness can be tuned against them.
+	if (raw.sharpness > 0.0f) {
+		result.sharpness = raw.sharpness;
+	}
+
 	// Important: only overwrite eyeBox/eyeCenter/confidence on a *valid* raw.
 	// Otherwise we keep the last good values so the overlay doesn't collapse
 	// to (0,0) during transient detection misses.
@@ -1852,6 +1900,17 @@ void EyeCameraStream::threadedFunction() {
 
 		RawDetection raw;
 		detectEye(job.pixels, raw);
+
+		// Blur gate: measure eye-box sharpness on every detection and demote
+		// too-blurry ones to a miss. The sharpness value itself is kept (and
+		// published below) so the threshold can be tuned live in the overlay.
+		if (raw.valid && raw.eyeBox.width > 0.0f && raw.eyeBox.height > 0.0f) {
+			raw.sharpness = computeEyeBoxSharpness(job.pixels, raw.eyeBox);
+			const float minSharp = parameters.minSharpness.get();
+			if (minSharp > 0.0f && raw.sharpness < minSharp) {
+				raw.valid = false;
+			}
+		}
 
 		if (raw.valid) {
 			++detectionsValid;
@@ -2220,6 +2279,7 @@ void EyeCameraStream::drawDetectionOverlay(float dispX, float dispY,
 	const float fitShown = snapResult.fitQuality > 0.0f ? snapResult.fitQuality : snapLastRaw.fitQuality;
 	std::string info = std::string("det=") + detName
 		+ "  fit=" + ofToString(fitShown, 2)
+		+ "  sharp=" + ofToString(snapResult.sharpness, 0)
 		+ "  dark=" + ofToString(snapLastRaw.darkness, 2)
 		+ "  cand=" + ofToString((unsigned)snapLastRaw.candidateBoxes.size())
 		+ "b/" + ofToString((unsigned)snapLastRaw.candidateIris.size()) + "i"

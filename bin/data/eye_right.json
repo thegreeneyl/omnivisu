@@ -70,6 +70,7 @@
             "jump_confirm_frames": "3",
             "jump_max_pos_frac": "0.25",
             "jump_max_size_frac": "0.35",
+            "min_sharpness": "100",
             "present_off_frames": "10",
             "present_on_frames": "4",
             "show_debug_overlay": "1",

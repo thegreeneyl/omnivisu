@@ -63,6 +63,7 @@ receiver. Re-applied live on config reload (`c`).
 | `async_readback` | bool | `true` | Double-buffered PBO readback: avoids the GPU pipeline stall at the cost of one frame of latency. |
 | `fade_in_seconds` | float | `0.5` | Presence fade-in: while at least one eye is PRESENT the cropped eye images (mask view, side-by-side view, and the stream — the raw camera view is unaffected) ramp from black to full over this time. `0` = instant. |
 | `fade_out_seconds` | float | `2.0` | Presence fade-out: while no eye is PRESENT the cropped eye images ramp to black over this time; at fully black the stream stops sending packets entirely and resumes as soon as an eye returns. `0` = instant. |
+| `fade_gamma` | float | `2.0` | Fade curve shaping: displayed brightness = fade^gamma. `1` = linear; higher values change brightness faster while bright and slower while dark (in both directions). Total fade durations are unaffected. |
 
 ### `mask`
 
@@ -189,6 +190,7 @@ In `boxiris` mode both `haar_*` and `iris_*` keys apply. In `haar` mode only the
 | `jump_max_pos_frac` | float | `0.25` | 0.0 – 2.0 | Jump gate on the eye-box anchor: a detection whose center is further than this fraction of the trusted eye-box width from the last trusted position is held back instead of moving the anchor. Stops a 1-2 frame false hit right before a blink (e.g. a pupil-like corner shadow) from becoming the frozen hold position. Lower if blinks still pull the frame inwards; raise if genuine fast moves feel sticky. |
 | `jump_max_size_frac` | float | `0.35` | 0.0 – 2.0 | Size companion to `jump_max_pos_frac`: a detection whose box width or height differs from the trusted box by more than this fraction (`0.35` = ±35%) is held back the same way (same confirm streak). Catches the oversized false box that sometimes appears just before a blink. Lower if the held frame still balloons on blinks; raise if normal detection size jitter keeps tripping the gate (watch `gate=` in the debug overlay). `0` disables the size check. |
 | `jump_confirm_frames` | int | `3` | 1 – 30 | Consecutive far detections (no misses in between) needed before a beyond-threshold (`jump_max_pos_frac` / `jump_max_size_frac`) detection is accepted as a real relocation; the anchor then snaps there. Lower to `2` if real relocations feel slow to take. |
+| `min_sharpness` | float | `0` | 0 – 2000 | Blur gate: variance-of-Laplacian sharpness of the eye-box image (measured on a fixed 96x96 patch, so it is independent of box size/resolution) below which a detection counts as a miss — the anchor holds and presence hysteresis applies, same as a detector dropout. `0` = disabled. Tune by watching `sharp=` in the raw debug view: note typical values for a sharp open eye vs blurry/defocused frames and set the threshold between them. |
 
 ### `grading`
 
