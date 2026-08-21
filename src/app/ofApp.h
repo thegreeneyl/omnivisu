@@ -93,9 +93,13 @@ private:
 	// render/readback/send is skipped entirely and resumes as soon as the
 	// fade rises again. Starts at 0 so everything is dark and the stream
 	// silent until the first eye is acquired.
+	// presenceFade ramps linearly in time; the streams receive
+	// presenceFade^streamFadeGamma so brightness changes fast while bright
+	// and slow while dark (gamma 1 = linear). Durations stay exact.
 	float presenceFade = 0.0f;
 	float streamFadeInSeconds = 0.5f;
 	float streamFadeOutSeconds = 2.0f;
+	float streamFadeGamma = 2.0f;
 
 	// Rolling CPU cost of updateStream() for the per-second diagnostic log.
 	double streamCpuUsSum = 0.0;

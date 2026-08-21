@@ -22,6 +22,10 @@ public:
 		// entirely. 0 seconds = instant snap.
 		float fadeInSeconds = 0.5f;
 		float fadeOutSeconds = 2.0f;
+		// Fade curve shaping: displayed brightness = fade^gamma. 1 = linear;
+		// higher = faster change while bright, slower while dark (both
+		// directions). Total durations are unaffected.
+		float fadeGamma = 2.0f;
 	};
 
 	/// Replay recorded image sequences instead of the live camera. When

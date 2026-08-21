@@ -172,6 +172,7 @@ void ofApp::applyStreamingConfig(const AppConfig::StreamingConfig & sc) {
 	streamFpsLimit = sc.fpsLimit;
 	streamFadeInSeconds = sc.fadeInSeconds;
 	streamFadeOutSeconds = sc.fadeOutSeconds;
+	streamFadeGamma = std::max(0.01f, sc.fadeGamma);
 	if (!streamPixels.isAllocated()) {
 		streamPixels.allocate(kStreamWidth, kStreamHeight, OF_PIXELS_RGB);
 	}
@@ -278,8 +279,12 @@ void ofApp::update() {
 				? std::max(0.0f, presenceFade - dt / streamFadeOutSeconds)
 				: 0.0f;
 		}
+		// Gamma-shape the displayed brightness: fast change while bright,
+		// slow while dark. The linear ramp above keeps durations and the
+		// stream stop-at-zero timing exact.
+		const float shapedFade = std::pow(presenceFade, streamFadeGamma);
 		for (const auto & stream : streams) {
-			stream->setPresenceFade(presenceFade);
+			stream->setPresenceFade(shapedFade);
 		}
 	}
 

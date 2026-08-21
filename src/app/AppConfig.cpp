@@ -39,6 +39,7 @@ bool AppConfig::load(const std::string & path) {
 		streaming.asyncReadback = s.value("async_readback", streaming.asyncReadback);
 		streaming.fadeInSeconds = s.value("fade_in_seconds", streaming.fadeInSeconds);
 		streaming.fadeOutSeconds = s.value("fade_out_seconds", streaming.fadeOutSeconds);
+		streaming.fadeGamma = s.value("fade_gamma", streaming.fadeGamma);
 	}
 
 	if (json.contains("playback")) {
