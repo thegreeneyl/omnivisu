@@ -10,11 +10,19 @@
 /// The mouth's WIDTH is gaze-driven: the left edge follows the left eye and the
 /// right edge follows the right eye, each sliding horizontally with the pupil's
 /// position within its eye opening. The height is fixed (config size.h).
+///
+/// The continuous mouth is rasterized through a discrete light grid (config
+/// "lights", default 14x1 — one texel per physical LED): the bar is drawn into
+/// a supersampled FBO, area-downsampled into the tiny lights FBO (so partially
+/// covered lights get fractional brightness), and the preview upscales that
+/// grid with nearest-neighbor filtering into the size/anchor footprint. What
+/// you see on the mask is therefore exactly what the LED strip can express.
 class Mouth {
 public:
-	/// Loads the mouth from the "mouth" JSON block (size, center anchor, color,
-	/// and an optional "control" sub-block for the gaze mapping). Returns false
-	/// (and logs) if the block is empty; the defaults below are kept in that case.
+	/// Loads the mouth from the "mouth" JSON block (size, lights grid, center
+	/// anchor, color, and an optional "control" sub-block for the gaze mapping).
+	/// Returns false (and logs) if the block is empty; the defaults below are
+	/// kept in that case. (Re)allocates the light-grid FBOs.
 	bool load(const ofJson & mouthJson);
 
 	bool isLoaded() const { return loaded; }
@@ -27,15 +35,33 @@ public:
 	/// Advances the edge smoothing by dt seconds.
 	void update(float dt);
 
-	/// Draws the mouth using the mask's image->screen transform, i.e. the scale
+	/// Draws the light-grid FBO (nearest-neighbor upscaled, so each light shows
+	/// as a hard cell) using the mask's image->screen transform, i.e. the scale
 	/// and (imgX, imgY) offset produced by MaskLayout::compute().
 	void draw(float scale, float imgX, float imgY) const;
+
+	/// The discrete light grid the mouth was rasterized into (lights.w x
+	/// lights.h texels, one per physical light). This is the future DMX source.
+	const ofFbo & getLightsFbo() const { return lightsFbo; }
+
+	/// Reads the current light grid back to the CPU (lights.w x lights.h RGBA
+	/// pixels, row-major). Intended for the future DMX/stream path; not called
+	/// per-frame by the app yet.
+	const ofPixels & getLightPixels();
 
 private:
 	/// Maps a raw gaze value to a 0..1 travel parameter via the input range.
 	float gazeToParam(float gaze) const;
 
+	/// (Re)allocates the lights + supersample FBOs to the current grid size.
+	void allocateLightFbos();
+
+	/// Rasterizes the current smoothed mouth edges into the light grid:
+	/// supersampled draw, then area-downsample into lightsFbo.
+	void renderLights();
+
 	glm::vec2 size{3000.0f, 200.0f};    ///< Base width/height in image-pixel space.
+	glm::ivec2 lights{14, 1};           ///< Discrete light grid (texels = physical lights).
 	glm::vec2 anchor{2000.0f, 2500.0f}; ///< Center in image-pixel space.
 	ofColor color{255, 255, 255, 100};  ///< Fill color with alpha.
 
@@ -57,6 +83,15 @@ private:
 	float rightGazeTarget = 0.0f;
 	float leftGazeSmoothed = 0.0f;
 	float rightGazeSmoothed = 0.0f;
+
+	/// Supersampling factor: the continuous bar is drawn at lights * kSupersample
+	/// resolution, then averaged down so edge lights get fractional brightness.
+	/// MSAA on a 14x1 target would give far too few samples per light.
+	static constexpr int kSupersample = 8;
+
+	ofFbo lightsFbo;   ///< lights.w x lights.h — one texel per physical light.
+	ofFbo lightsSsFbo; ///< Supersample target (lights * kSupersample).
+	ofPixels lightsPixels; ///< CPU copy of lightsFbo, filled by getLightPixels().
 
 	bool loaded = false;
 };

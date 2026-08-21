@@ -37,6 +37,13 @@ because they only take effect when the stream is created.
         "anchor":     { "x": 2000, "y": 1500 },
         "left_eye":   { "x": 1030, "y": 1073, "w": 414, "h": 280 },
         "right_eye":  { "x": 2551, "y": 1071, "w": 414, "h": 280 }
+    },
+    "mouth": {
+        "size":   { "w": 2500, "h": 38 },
+        "lights": { "w": 14, "h": 1 },
+        "anchor": { "x": 2000, "y": 2015 },
+        "color":  { "r": 255, "g": 255, "b": 255, "a": 150 },
+        "control": { ... }
     }
 }
 ```
@@ -80,6 +87,26 @@ to the window center.
 
 > Note: per-eye `"stream"` indices were removed. Left/right are now positional —
 > `eye_left.json` always drives the `left_eye` opening, `eye_right.json` the `right_eye`.
+
+### `mouth`
+
+Gaze-driven mouth bar, living in the same image-pixel space as the mask. The
+continuous mouth is rendered through a discrete light grid (`lights`, one texel
+per physical LED) before display, so the on-screen preview only shows what the
+14-light hardware strip can express: the small grid FBO is filled with
+supersampled (area-averaged) coverage and upscaled to the `size` footprint with
+nearest-neighbor filtering — partial coverage shows as a dimmer whole cell.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `size.w` / `size.h` | float | `3000` / `200` | On-screen mouth footprint in image pixels (centered on `anchor`). |
+| `lights.w` / `lights.h` | int | `14` / `1` | Discrete light-grid resolution; one texel per physical light. The mouth is rasterized into this grid before display (and, later, before being streamed as DMX values). |
+| `anchor.x` / `anchor.y` | float | `2000` / `2500` | Mouth center in image pixels. |
+| `color` | rgba | `255,255,255,100` | Fill color with alpha. |
+| `control.gaze_in_min` / `control.gaze_in_max` | float | `-0.5` / `0.5` | Raw gaze range mapped to edge travel 0..1. |
+| `control.left_edge_extend` / `control.left_edge_retract` | float | `-1.0` / `0.333` | Left edge position (half-width units from center) when looking left / right. |
+| `control.right_edge_retract` / `control.right_edge_extend` | float | `-0.333` / `1.0` | Right edge position when looking left / right. |
+| `control.smoothing` | float | `0.5` | Edge smoothing: `0` = none, `1` = ~0.5 s time constant. |
 
 ---
 

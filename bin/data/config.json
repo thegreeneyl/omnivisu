@@ -32,9 +32,10 @@
         "right_eye":  { "x": 2551, "y": 1071, "w": 414, "h": 280 }
     },
     "mouth": {
-        "size": { "w": 2500, "h": 38 },
+        "size": { "w": 1940, "h": 38 },
+        "lights": { "w": 14, "h": 1 },
         "anchor":     { "x": 2000, "y": 2015 },
-        "color": { "r": 255, "g": 255, "b": 255, "a": 150 },
+        "color": { "r": 255, "g": 255, "b": 255, "a": 180 },
         "control": {
             "gaze_in_min": -0.5,
             "gaze_in_max": 0.5,
@@ -42,7 +43,7 @@
             "left_edge_retract": 0.333,
             "right_edge_retract": -0.333,
             "right_edge_extend": 1.0,
-            "smoothing": 0.0
+            "smoothing": 0.5
         }
     }
 }
