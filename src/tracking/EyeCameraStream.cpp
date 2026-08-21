@@ -61,6 +61,9 @@ void EyeCameraStream::setupParameters() {
 	parameters.trackingGroup.add(parameters.presentOffFrames);
 	parameters.trackingGroup.add(parameters.euroMinCutoff);
 	parameters.trackingGroup.add(parameters.euroBeta);
+	parameters.trackingGroup.add(parameters.jumpMaxPosFrac);
+	parameters.trackingGroup.add(parameters.jumpMaxSizeFrac);
+	parameters.trackingGroup.add(parameters.jumpConfirmFrames);
 	parameters.group.add(parameters.trackingGroup);
 
 	parameters.gradingGroup.clear();
@@ -1483,6 +1486,9 @@ void EyeCameraStream::applySmoothing(const RawDetection & raw, float dt) {
 	} else {
 		++presentMissStreak;
 		presentHitStreak = 0;
+		// A relocation must be confirmed by *consecutive* valid detections; a
+		// miss in between (typical for blink artifacts) voids the streak.
+		jumpConfirmStreak = 0;
 	}
 
 	if (!presentSmoothed && presentHitStreak >= parameters.presentOnFrames) {
@@ -1497,6 +1503,11 @@ void EyeCameraStream::applySmoothing(const RawDetection & raw, float dt) {
 		// Also drop the mode-5 tracker so a prolonged loss forces a fresh Haar
 		// re-acquisition rather than resuming from a stale eye reference.
 		irisTrackValid = false;
+		// The jump-gate anchor is deliberately KEPT through the loss: it is
+		// what holds the frame in place while sporadic false hits (corner
+		// shadow of the closed eye) arrive during LOST. The PRESENT-on reset
+		// re-seeds it from wherever the eye is actually re-acquired.
+		jumpConfirmStreak = 0;
 	}
 
 	result.present = presentSmoothed;
@@ -1529,6 +1540,63 @@ void EyeCameraStream::applySmoothing(const RawDetection & raw, float dt) {
 			filterBoxH.reset(raw.eyeBox.height);
 			filterIrisX.reset(raw.irisCenter.x);
 			filterIrisY.reset(raw.irisCenter.y);
+			committedEyeCenter = {rawBoxCx, rawBoxCy};
+			committedEyeSize = {raw.eyeBox.width, raw.eyeBox.height};
+			hasCommittedEyeCenter = true;
+			jumpConfirmStreak = 0;
+		}
+
+		// Jump gate on the eye-box anchor: a detection whose center OR box size
+		// is far from the committed anchor is either a brief false hit (e.g. a
+		// corner shadow or an oversized box just before a blink) or a real
+		// relocation. Hold the anchor for the former; accept after
+		// jump_confirm_frames consecutive far detections for the latter.
+		// Only the eye box/center (the follow/hold anchor) is gated; the iris
+		// keeps updating so gaze stays live.
+		bool acceptEyeAnchor = true;
+		if (presentSmoothed) {
+			if (!hasCommittedEyeCenter) {
+				committedEyeCenter = {rawBoxCx, rawBoxCy};
+				committedEyeSize = {raw.eyeBox.width, raw.eyeBox.height};
+				hasCommittedEyeCenter = true;
+				jumpConfirmStreak = 0;
+			} else {
+				// Scale by the *trusted* width, not the incoming one, so an
+				// oversized false box can't loosen its own position gate.
+				const float maxJump = std::max(1.0f,
+					parameters.jumpMaxPosFrac.get() * std::max(committedEyeSize.x, 1.0f));
+				const float dx = rawBoxCx - committedEyeCenter.x;
+				const float dy = rawBoxCy - committedEyeCenter.y;
+				const bool posJump = dx * dx + dy * dy > maxJump * maxJump;
+
+				// Relative width/height change vs the trusted box.
+				bool sizeJump = false;
+				const float sizeFrac = parameters.jumpMaxSizeFrac.get();
+				if (sizeFrac > 0.0f) {
+					const float dw = std::abs(raw.eyeBox.width - committedEyeSize.x)
+						/ std::max(1.0f, committedEyeSize.x);
+					const float dh = std::abs(raw.eyeBox.height - committedEyeSize.y)
+						/ std::max(1.0f, committedEyeSize.y);
+					sizeJump = dw > sizeFrac || dh > sizeFrac;
+				}
+
+				if (posJump || sizeJump) {
+					++jumpConfirmStreak;
+					if (jumpConfirmStreak >= parameters.jumpConfirmFrames.get()) {
+						// Confirmed relocation: snap the anchor filters to the
+						// new position instead of dragging them across.
+						filterEyeX.reset(rawBoxCx);
+						filterEyeY.reset(rawBoxCy);
+						filterBoxW.reset(raw.eyeBox.width);
+						filterBoxH.reset(raw.eyeBox.height);
+						jumpConfirmStreak = 0;
+					} else {
+						acceptEyeAnchor = false;
+					}
+				} else {
+					jumpConfirmStreak = 0;
+				}
+			}
 		}
 
 		float cx = rawBoxCx;
@@ -1537,17 +1605,47 @@ void EyeCameraStream::applySmoothing(const RawDetection & raw, float dt) {
 		float bh = raw.eyeBox.height;
 		glm::vec2 iris = raw.irisCenter;
 		if (presentSmoothed) {
-			cx = filterEyeX.filter(rawBoxCx, dt);
-			cy = filterEyeY.filter(rawBoxCy, dt);
-			bw = filterBoxW.filter(raw.eyeBox.width, dt);
-			bh = filterBoxH.filter(raw.eyeBox.height, dt);
+			if (acceptEyeAnchor) {
+				cx = filterEyeX.filter(rawBoxCx, dt);
+				cy = filterEyeY.filter(rawBoxCy, dt);
+				bw = filterBoxW.filter(raw.eyeBox.width, dt);
+				bh = filterBoxH.filter(raw.eyeBox.height, dt);
+				committedEyeCenter = {cx, cy};
+				committedEyeSize = {bw, bh};
+			}
 			iris.x = filterIrisX.filter(raw.irisCenter.x, dt);
 			iris.y = filterIrisY.filter(raw.irisCenter.y, dt);
 		}
 
-		result.eyeCenter = {cx, cy};
-		result.eyeBox = ofRectangle(cx - bw * 0.5f, cy - bh * 0.5f, bw, bh);
+		// The published eye anchor only moves on trusted detections: while
+		// PRESENT it must pass the jump gate; while LOST it is held at the
+		// trusted anchor and un-gated hits merely feed presence re-acquisition
+		// (only before the very first acquisition does raw pass straight
+		// through, so the overlay shows something at startup).
+		const bool writeAnchor = presentSmoothed
+			? acceptEyeAnchor
+			: !hasCommittedEyeCenter;
+		if (writeAnchor) {
+			result.eyeCenter = {cx, cy};
+			result.eyeBox = ofRectangle(cx - bw * 0.5f, cy - bh * 0.5f, bw, bh);
+		}
 		result.irisCenter = iris;
+
+		// Publish jump-gate debug state for the raw-view overlay. The trusted
+		// anchor is drawn every frame; a rejected/ignored detection stays
+		// visible until the next accepted one so a blink can be inspected.
+		if (presentSmoothed && acceptEyeAnchor) {
+			result.committedEyeBox = result.eyeBox;
+			result.committedValid = true;
+			result.rejectedValid = false;
+		} else if (presentSmoothed || hasCommittedEyeCenter) {
+			result.rejectedEyeBox = ofRectangle(
+				rawBoxCx - raw.eyeBox.width * 0.5f,
+				rawBoxCy - raw.eyeBox.height * 0.5f,
+				raw.eyeBox.width, raw.eyeBox.height);
+			result.rejectedValid = true;
+		}
+		result.jumpStreak = jumpConfirmStreak;
 	}
 
 	presentSmoothedPrev = presentSmoothed;
@@ -1721,6 +1819,8 @@ void EyeCameraStream::threadedFunction() {
 			presentMissStreak = 0;
 			hasLastEyeBox = false;
 			irisTrackValid = false;
+			hasCommittedEyeCenter = false;
+			jumpConfirmStreak = 0;
 			std::lock_guard<std::mutex> lk(stateMutex);
 			resetWorkerStateLocked();
 			continue;
@@ -2055,6 +2155,40 @@ void EyeCameraStream::drawDetectionOverlay(float dispX, float dispY,
 		ofDrawBitmapStringHighlight(boxInfo, dispBoxX, std::max(dispY + 12.0f, dispBoxY - 6.0f));
 	}
 
+	// Jump-gate debug: the last *trusted* anchor (orange) and, if the gate held
+	// back a far detection, that rejected box (magenta). When the fix works,
+	// the green/red result box stays glued to the orange one through a blink
+	// while the magenta box marks the false hit that was ignored.
+	auto drawSrcRect = [&](const ofRectangle & r) {
+		const float rx = mirror ? (srcW - (r.x + r.width)) : r.x;
+		ofDrawRectangle(imgX + rx * dispScaleX, imgY + r.y * dispScaleY,
+			r.width * dispScaleX, r.height * dispScaleY);
+	};
+	if (trackingOn && snapResult.committedValid && snapResult.committedEyeBox.width > 0.0f) {
+		ofNoFill();
+		ofSetLineWidth(1.5f);
+		ofSetColor(255, 160, 0, 230);
+		drawSrcRect(snapResult.committedEyeBox);
+		const float tcx = mapSrcToDispX(snapResult.committedEyeBox.getCenter().x);
+		const float tcy = mapSrcToDispY(snapResult.committedEyeBox.getCenter().y);
+		const float cross = 8.0f;
+		ofDrawLine(tcx - cross, tcy, tcx + cross, tcy);
+		ofDrawLine(tcx, tcy - cross, tcx, tcy + cross);
+	}
+	if (trackingOn && snapResult.rejectedValid && snapResult.rejectedEyeBox.width > 0.0f) {
+		ofNoFill();
+		ofSetLineWidth(1.5f);
+		ofSetColor(255, 0, 255, 230);
+		drawSrcRect(snapResult.rejectedEyeBox);
+		const float rxDisp = mirror
+			? (srcW - (snapResult.rejectedEyeBox.x + snapResult.rejectedEyeBox.width))
+			: snapResult.rejectedEyeBox.x;
+		ofDrawBitmapStringHighlight("HELD",
+			imgX + rxDisp * dispScaleX,
+			imgY + snapResult.rejectedEyeBox.y * dispScaleY - 6.0f,
+			ofColor(0, 0, 0, 180), ofColor(255, 0, 255));
+	}
+
 	// Presence + worker heartbeat at the top of the displayed quad.
 	std::string state;
 	if (!trackingOn) {
@@ -2080,7 +2214,12 @@ void EyeCameraStream::drawDetectionOverlay(float dispX, float dispY,
 		+ "b/" + ofToString((unsigned)snapLastRaw.candidateIris.size()) + "i"
 		+ "  runs=" + ofToString((unsigned long long)runs)
 		+ "  hits=" + ofToString((unsigned long long)hits)
-		+ "  conf=" + ofToString(snapResult.confidence, 2);
+		+ "  conf=" + ofToString(snapResult.confidence, 2)
+		+ "  gate=" + (snapResult.rejectedValid ? "HELD" : "ok")
+		+ (snapResult.jumpStreak > 0
+			? ("(" + ofToString(snapResult.jumpStreak) + "/"
+				+ ofToString(parameters.jumpConfirmFrames.get()) + ")")
+			: "");
 	ofDrawBitmapStringHighlight(info, dispX + 6, dispY + 36);
 
 	ofPopStyle();

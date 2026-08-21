@@ -75,6 +75,17 @@ public:
 		glm::vec2 gaze = {0, 0};       ///< Normalized iris offset vs neutral.
 		float openness = 1.0f;         ///< 0 = closed .. 1 = wide open.
 		bool blink = false;
+
+		// Jump-gate debug state for the raw-view overlay. committedEyeBox is
+		// the last *trusted* anchor (what the gate compares against);
+		// rejectedEyeBox is the most recent detection the gate held back.
+		// Both persist through a loss so a blink can be inspected afterwards;
+		// they update/clear on the next accepted detection.
+		ofRectangle committedEyeBox;
+		bool committedValid = false;
+		ofRectangle rejectedEyeBox;
+		bool rejectedValid = false;
+		int jumpStreak = 0;            ///< Consecutive far hits pending confirmation.
 	};
 
 	bool setup(const Config & cfg);
@@ -255,6 +266,22 @@ private:
 		ofParameter<int> presentOffFrames{"present off frames", 10, 1, 60};
 		ofParameter<float> euroMinCutoff{"euro min cutoff", 0.5f, 0.01f, 5.0f};
 		ofParameter<float> euroBeta{"euro beta", 0.007f, 0.0f, 0.1f};
+		// Jump gate for the eye-box anchor. A valid detection whose center is
+		// further than jump_max_pos_frac * eye-box width from the last committed
+		// center is held back (anchor keeps its previous value) until
+		// jump_confirm_frames consecutive detections agree on the far
+		// position; then the anchor snaps there. This stops a 1-2 frame false
+		// hit right before a blink (e.g. a pupil-like corner shadow) from
+		// becoming the held position while the eye is closed, without slowing
+		// normal small eye-following motion.
+		ofParameter<float> jumpMaxPosFrac{"jump max pos frac", 0.25f, 0.0f, 2.0f};
+		// Size companion to jump_max_pos_frac: a detection whose box width or
+		// height differs from the trusted box by more than this fraction
+		// (e.g. 0.35 = ±35%) is held back the same way, sharing the same
+		// confirm streak. Catches the oversized false box that sometimes
+		// appears just before a blink. 0 disables the size check.
+		ofParameter<float> jumpMaxSizeFrac{"jump max size frac", 0.35f, 0.0f, 2.0f};
+		ofParameter<int> jumpConfirmFrames{"jump confirm frames", 3, 1, 30};
 
 		ofParameterGroup gradingGroup{"grading"};
 		ofParameter<bool> enableGrading{"enable grading", true};
@@ -441,6 +468,14 @@ private:
 	int presentMissStreak = 0;
 	bool presentSmoothed = false;
 	bool presentSmoothedPrev = false;
+
+	// Jump-gate state (worker-thread only): last trusted eye-box center that
+	// detections are compared against, and how many consecutive valid
+	// detections have landed beyond the jump threshold.
+	glm::vec2 committedEyeCenter{0.0f, 0.0f};
+	glm::vec2 committedEyeSize{0.0f, 0.0f};
+	bool hasCommittedEyeCenter = false;
+	int jumpConfirmStreak = 0;
 	float workerLastFrameTime = 0.0f;
 
 	ofThreadChannel<FrameJob> frameJobs;

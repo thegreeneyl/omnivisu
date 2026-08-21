@@ -180,6 +180,9 @@ In `boxiris` mode both `haar_*` and `iris_*` keys apply. In `haar` mode only the
 | `present_off_frames` | int | `10` | 1 – 60 | Consecutive misses required to flip to LOST. |
 | `euro_min_cutoff` | float | `0.5` | 0.01 – 5.0 | One Euro filter min cutoff (lower = smoother, more lag). |
 | `euro_beta` | float | `0.007` | 0.0 – 0.1 | One Euro filter speed coefficient (higher = less lag on fast motion). |
+| `jump_max_pos_frac` | float | `0.25` | 0.0 – 2.0 | Jump gate on the eye-box anchor: a detection whose center is further than this fraction of the trusted eye-box width from the last trusted position is held back instead of moving the anchor. Stops a 1-2 frame false hit right before a blink (e.g. a pupil-like corner shadow) from becoming the frozen hold position. Lower if blinks still pull the frame inwards; raise if genuine fast moves feel sticky. |
+| `jump_max_size_frac` | float | `0.35` | 0.0 – 2.0 | Size companion to `jump_max_pos_frac`: a detection whose box width or height differs from the trusted box by more than this fraction (`0.35` = ±35%) is held back the same way (same confirm streak). Catches the oversized false box that sometimes appears just before a blink. Lower if the held frame still balloons on blinks; raise if normal detection size jitter keeps tripping the gate (watch `gate=` in the debug overlay). `0` disables the size check. |
+| `jump_confirm_frames` | int | `3` | 1 – 30 | Consecutive far detections (no misses in between) needed before a beyond-threshold (`jump_max_pos_frac` / `jump_max_size_frac`) detection is accepted as a real relocation; the anchor then snaps there. Lower to `2` if real relocations feel slow to take. |
 
 ### `grading`
 
