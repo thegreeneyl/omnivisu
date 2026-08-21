@@ -1520,6 +1520,22 @@ float EyeCameraStream::getGazeX() const {
 }
 
 //--------------------------------------------------------------
+float EyeCameraStream::getGazeY() const {
+	std::lock_guard<std::mutex> lk(stateMutex);
+	// Same guards as getGazeX: neutral while absent so driven features relax.
+	if (!result.present) {
+		return 0.0f;
+	}
+	const float halfH = result.eyeBox.height * 0.5f;
+	if (halfH <= 1.0f || result.irisRadiusPx <= 0.0f) {
+		return 0.0f; // no eye box or no fitted iris (e.g. haar mode).
+	}
+	// Image Y grows downward; flip so positive means "looking up". Vertical is
+	// not affected by the horizontal display mirroring.
+	return (result.eyeCenter.y - result.irisCenter.y) / halfH;
+}
+
+//--------------------------------------------------------------
 void EyeCameraStream::applySmoothing(const RawDetection & raw, float dt) {
 	if (raw.valid) {
 		++presentHitStreak;

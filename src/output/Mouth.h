@@ -2,14 +2,21 @@
 
 #include "ofMain.h"
 
+#include <vector>
+
 /// JSON-driven mouth feature living in the same image-pixel coordinate space as
 /// the mask (and the eye openings). Defined by a center anchor, a base size, and
 /// an RGBA fill color. Drawn using the mask's cover-fit transform (scale +
 /// clamped image offset) so it stays locked to the face at any window size.
 ///
-/// The mouth's WIDTH is gaze-driven: the left edge follows the left eye and the
-/// right edge follows the right eye, each sliding horizontally with the pupil's
-/// position within its eye opening. The height is fixed (config size.h).
+/// Control model: the combined (averaged-over-present-eyes) gaze drives two
+/// independently quantized channels with hysteresis, so the mouth holds
+/// deliberate poses instead of tracking the eyes continuously:
+///   - horizontal gaze -> POSITION state (looking right moves the mouth right),
+///   - vertical gaze   -> WIDTH state (looking up widens, down narrows; the
+///     width list is config-driven and never below 1 light).
+/// The resulting target always lands on whole lights of the grid; the current
+/// edges ease smoothly toward it, which reads as lights handing over.
 ///
 /// The continuous mouth is rasterized through a discrete light grid (config
 /// "lights", default 14x1 — one texel per physical LED): the bar is drawn into
@@ -20,19 +27,21 @@
 class Mouth {
 public:
 	/// Loads the mouth from the "mouth" JSON block (size, lights grid, center
-	/// anchor, color, and an optional "control" sub-block for the gaze mapping).
-	/// Returns false (and logs) if the block is empty; the defaults below are
-	/// kept in that case. (Re)allocates the light-grid FBOs.
+	/// anchor, color, and an optional "control" sub-block for the state
+	/// mapping). Returns false (and logs) if the block is empty; the defaults
+	/// below are kept in that case. (Re)allocates the light-grid FBOs.
 	bool load(const ofJson & mouthJson);
 
 	bool isLoaded() const { return loaded; }
 
-	/// Feeds the latest per-eye normalized horizontal gaze (display orientation:
-	/// negative = looking left, positive = looking right, 0 = centered). These
-	/// are the targets that update() smooths toward.
-	void setGaze(float leftGazeX, float rightGazeX);
+	/// Feeds the latest per-eye normalized gaze (x: negative = looking left,
+	/// positive = right; y: positive = looking up) plus eye presence. The mouth
+	/// averages the PRESENT eyes; with both absent it relaxes to neutral.
+	void setGaze(const glm::vec2 & leftGaze, bool leftPresent,
+		const glm::vec2 & rightGaze, bool rightPresent);
 
-	/// Advances the edge smoothing by dt seconds.
+	/// Advances input smoothing, the state machines, and the edge easing by dt
+	/// seconds, then re-rasterizes the light grid.
 	void update(float dt);
 
 	/// Draws the light-grid FBO (nearest-neighbor upscaled, so each light shows
@@ -50,13 +59,35 @@ public:
 	const ofPixels & getLightPixels();
 
 private:
-	/// Maps a raw gaze value to a 0..1 travel parameter via the input range.
-	float gazeToParam(float gaze) const;
+	/// One quantized control channel: splits the normalized 0..1 input into
+	/// `stateCount` equal bands and holds the current state until the input
+	/// leaves the current band by more than `hysteresis` band-widths AND the
+	/// state has been held for at least `minDwellSeconds` (Schmitt trigger +
+	/// dwell gate — kills boundary ping-pong and hectic sweeps).
+	struct QuantizedChannel {
+		int stateCount = 2;
+		float hysteresis = 0.35f;     ///< Fraction of one band width.
+		float minDwellSeconds = 0.25f;
+
+		int state = 0;
+		float dwell = 1e9f; ///< Seconds in the current state (starts "expired").
+
+		/// Resets to the state whose band contains `param` (no hysteresis).
+		void reset(float param);
+		/// Advances by dt with the current normalized input; returns true when
+		/// the state changed.
+		bool advance(float param, float dt);
+	};
 
 	/// (Re)allocates the lights + supersample FBOs to the current grid size.
 	void allocateLightFbos();
 
-	/// Rasterizes the current smoothed mouth edges into the light grid:
+	/// Recomputes the integer target edges (in light units) from the current
+	/// channel states: width from the widths list, position spread across the
+	/// travel left for that width. Always whole lights, always inside the grid.
+	void computeTargetEdges();
+
+	/// Rasterizes the current (eased) mouth edges into the light grid:
 	/// supersampled draw, then area-downsample into lightsFbo.
 	void renderLights();
 
@@ -65,24 +96,27 @@ private:
 	glm::vec2 anchor{2000.0f, 2500.0f}; ///< Center in image-pixel space.
 	ofColor color{255, 255, 255, 100};  ///< Fill color with alpha.
 
-	// Gaze -> edge-position mapping. Offsets are in half-width units relative to
-	// the center: -1 = the rectangle's left edge, +1 = its right edge, 0 = center.
-	// As gaze sweeps left->right, each edge lerps from its first to its second
-	// value, so by default the right edge travels from 1/3 left of center out to
-	// the right edge, and the left edge from the left edge in to 1/3 right of
-	// center.
-	float gazeInMin = -0.5f;            ///< Gaze mapped to travel param 0 (full left).
-	float gazeInMax = 0.5f;             ///< Gaze mapped to travel param 1 (full right).
-	float leftEdgeExtend = -1.0f;       ///< Left edge when looking left (param 0).
-	float leftEdgeRetract = 0.333f;     ///< Left edge when looking right (param 1).
-	float rightEdgeRetract = -0.333f;   ///< Right edge when looking left (param 0).
-	float rightEdgeExtend = 1.0f;       ///< Right edge when looking right (param 1).
-	float smoothing = 0.0f;             ///< 0 = none .. 1 = ~0.5 s time constant.
+	// Control config (JSON "control" block).
+	float gazeXMin = -0.5f;             ///< Horizontal gaze mapped to position param 0 (left).
+	float gazeXMax = 0.5f;              ///< Horizontal gaze mapped to position param 1 (right).
+	float gazeYMin = -0.4f;             ///< Vertical gaze mapped to width param 0 (narrowest).
+	float gazeYMax = 0.4f;              ///< Vertical gaze mapped to width param 1 (widest).
+	int positionStates = 5;             ///< Number of horizontal position states.
+	std::vector<int> widths{2, 5, 9, 14}; ///< Width states in lights, narrow -> wide (>= 1).
+	float hysteresis = 0.35f;           ///< Band-exit margin, fraction of one band.
+	float minDwellSeconds = 0.25f;      ///< Minimum time between state changes.
+	float transitionSeconds = 0.15f;    ///< Ease duration toward a new target (~95%).
+	float smoothing = 0.2f;             ///< Input low-pass time constant in seconds (0 = raw).
 
-	float leftGazeTarget = 0.0f;
-	float rightGazeTarget = 0.0f;
-	float leftGazeSmoothed = 0.0f;
-	float rightGazeSmoothed = 0.0f;
+	// Runtime state.
+	glm::vec2 gazeTarget{0.0f, 0.0f};   ///< Latest averaged gaze input.
+	glm::vec2 gazeSmoothed{0.0f, 0.0f}; ///< Low-passed gaze input.
+	QuantizedChannel positionChannel;
+	QuantizedChannel widthChannel;
+	float targetLeftLight = 0.0f;       ///< Integer-valued target edges, light units.
+	float targetRightLight = 1.0f;
+	float currentLeftLight = 0.0f;      ///< Eased edges the rasterizer draws.
+	float currentRightLight = 1.0f;
 
 	/// Supersampling factor: the continuous bar is drawn at lights * kSupersample
 	/// resolution, then averaged down so edge lights get fractional brightness.

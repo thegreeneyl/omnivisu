@@ -114,6 +114,13 @@ public:
 	/// there is no current detection or no fitted iris.
 	float getGazeX() const;
 
+	/// Normalized vertical gaze of the pupil within the eye opening: 0 =
+	/// centered, positive = looking UP, negative = looking down (image Y grows
+	/// downward, so the sign is flipped for intuitive use). Defined as
+	/// (eyeCenter.y - irisCenter.y) / (eyeBox.height / 2). Returns 0 when there
+	/// is no current detection or no fitted iris. Not mirror-dependent.
+	float getGazeY() const;
+
 #if !defined(OMNIVISU_NO_CAMERA)
 	const ofxIdsPeak::Grabber & getGrabber() const { return liveSource->grabber(); }
 	ofParameterGroup & getGrabberParameters() { return liveSource->grabber().parameters.group; }

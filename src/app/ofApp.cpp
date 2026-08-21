@@ -292,12 +292,23 @@ void ofApp::update() {
 		stream->update();
 	}
 
-	// Drive the mouth width from gaze: streams[0] = left eye -> left edge,
-	// streams[1] = right eye -> right edge.
+	// Drive the mouth state machine from the combined gaze: the mouth averages
+	// the present eyes' gaze; horizontal picks the position state, vertical the
+	// width state. streams[0] = left eye, streams[1] = right eye.
 	if (mouthLoaded) {
-		const float leftGaze = streams.size() > 0 ? streams[0]->getGazeX() : 0.0f;
-		const float rightGaze = streams.size() > 1 ? streams[1]->getGazeX() : 0.0f;
-		mouth.setGaze(leftGaze, rightGaze);
+		glm::vec2 leftGaze{0.0f, 0.0f};
+		glm::vec2 rightGaze{0.0f, 0.0f};
+		bool leftPresent = false;
+		bool rightPresent = false;
+		if (streams.size() > 0) {
+			leftGaze = {streams[0]->getGazeX(), streams[0]->getGazeY()};
+			leftPresent = streams[0]->getResult().present;
+		}
+		if (streams.size() > 1) {
+			rightGaze = {streams[1]->getGazeX(), streams[1]->getGazeY()};
+			rightPresent = streams[1]->getResult().present;
+		}
+		mouth.setGaze(leftGaze, leftPresent, rightGaze, rightPresent);
 		mouth.update(static_cast<float>(ofGetLastFrameTime()));
 	}
 

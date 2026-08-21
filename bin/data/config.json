@@ -37,13 +37,16 @@
         "anchor":     { "x": 2000, "y": 2015 },
         "color": { "r": 255, "g": 255, "b": 255, "a": 180 },
         "control": {
-            "gaze_in_min": -0.5,
-            "gaze_in_max": 0.5,
-            "left_edge_extend": -1.0,
-            "left_edge_retract": 0.333,
-            "right_edge_retract": -0.333,
-            "right_edge_extend": 1.0,
-            "smoothing": 0.5
+            "gaze_x_min": -0.5,
+            "gaze_x_max": 0.5,
+            "gaze_y_min": -0.4,
+            "gaze_y_max": 0.4,
+            "position_states": 5,
+            "widths": [1, 2, 4, 6, 12],
+            "hysteresis": 0.15,
+            "min_dwell_seconds": 0.25,
+            "transition_seconds": 0.15,
+            "smoothing": 0.1
         }
     }
 }

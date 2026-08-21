@@ -97,16 +97,39 @@ per physical LED) before display, so the on-screen preview only shows what the
 supersampled (area-averaged) coverage and upscaled to the `size` footprint with
 nearest-neighbor filtering — partial coverage shows as a dimmer whole cell.
 
+The mouth holds deliberate poses instead of tracking the eyes continuously.
+The gaze of the present eyes is averaged and drives two quantized channels
+with hysteresis and a dwell-time gate:
+
+- **Horizontal gaze -> position state.** Looking right moves the mouth right,
+  looking left moves it left, across `position_states` discrete positions.
+- **Vertical gaze -> width state.** Looking up widens the mouth, looking down
+  narrows it, stepping through the `widths` list (in lights, never below 1).
+
+Targets always land on whole lights; the visible edges ease smoothly toward
+them over `transition_seconds`, so a pose change reads as lights handing over.
+A state only switches when the input leaves the current state's band by more
+than `hysteresis` band-widths AND the state has been held for at least
+`min_dwell_seconds` — both must pass, which kills boundary ping-pong. Every
+state change is logged (`[notice] Mouth: state -> ...`) to help tuning.
+
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `size.w` / `size.h` | float | `3000` / `200` | On-screen mouth footprint in image pixels (centered on `anchor`). |
 | `lights.w` / `lights.h` | int | `14` / `1` | Discrete light-grid resolution; one texel per physical light. The mouth is rasterized into this grid before display (and, later, before being streamed as DMX values). |
 | `anchor.x` / `anchor.y` | float | `2000` / `2500` | Mouth center in image pixels. |
 | `color` | rgba | `255,255,255,100` | Fill color with alpha. |
-| `control.gaze_in_min` / `control.gaze_in_max` | float | `-0.5` / `0.5` | Raw gaze range mapped to edge travel 0..1. |
-| `control.left_edge_extend` / `control.left_edge_retract` | float | `-1.0` / `0.333` | Left edge position (half-width units from center) when looking left / right. |
-| `control.right_edge_retract` / `control.right_edge_extend` | float | `-0.333` / `1.0` | Right edge position when looking left / right. |
-| `control.smoothing` | float | `0.5` | Edge smoothing: `0` = none, `1` = ~0.5 s time constant. |
+| `control.gaze_x_min` / `control.gaze_x_max` | float | `-0.5` / `0.5` | Horizontal gaze range mapped onto the position states (min = leftmost, max = rightmost). Narrow the range to reach the extremes with smaller eye movements. |
+| `control.gaze_y_min` / `control.gaze_y_max` | float | `-0.4` / `0.4` | Vertical gaze range mapped onto the width states (min = looking down = narrowest, max = looking up = widest). |
+| `control.position_states` | int | `5` | Number of discrete horizontal positions the mouth can take. |
+| `control.widths` | int array | `[2, 5, 9, 14]` | Width states in lights, narrow to wide. Entries are clamped to >= 1 light and to the grid width. |
+| `control.hysteresis` | float | `0.35` | How far (in fractions of one state band) the input must cross past the current state's boundary before a switch is considered. Higher = more deliberate. |
+| `control.min_dwell_seconds` | float | `0.25` | Minimum hold time per state; caps the state-change rate during fast gaze sweeps. |
+| `control.transition_seconds` | float | `0.15` | Ease duration toward a new target (move is ~95% done after this time). `0` = instant snap. |
+| `control.smoothing` | float | `0.2` | Input low-pass time constant in seconds, applied to the gaze before quantization. `0` = raw. |
+
+> Note: the former continuous edge mapping (`gaze_in_min/max`,
+> `left/right_edge_extend/retract`) was replaced by this state model.
 
 ---
 
